@@ -1,0 +1,23 @@
+ppo:
+  lr: 0.005 # was 0.0005
+  gamma: 0.99
+  epsilon_clip: 0.1
+  k_epochs: 3
+  self_play_games: 1000
+  max_moves: 100
+  device: "cpu"
+  print_self_play: false
+  temperature: 1.0 # was 10.0 # Added: Higher values = more exploration, lower = more exploitation
+paths:
+  save_model_path: "models/chess_ppo_checkpoint.pth"
+  load_model_path: "models/chess_ppo_checkpoint.pth"
+  games_dir: "self-play-games"
+  metrics_dir: "training-metrics"
+metrics:
+  rate_print_progress: 25 # Print progress every 25 games
+  plot_metrics: true
+  metrics_smoothing: 10
+  games_per_file: 25
+  metrics_format: "json"
+agent:
+  aggression: 0.0
