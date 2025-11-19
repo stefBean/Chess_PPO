@@ -7,6 +7,7 @@ This module contains a basic `Chess` environment. It relies heavily on the
 """
 
 from typing import Tuple, Optional, Dict, List
+from reward_shaping import RewardShaper
 
 import chess
 import gymnasium as gym
@@ -76,6 +77,8 @@ class Chess(gym.Env):
     def __init__(self) -> None:
         #: The underlying chess.Board instance that represents the game.
         self._board: Optional[chess.Board] = None
+        self.shaper = RewardShaper()
+        self.move_count = 0
 
         #: Indicates whether the env has been reset since it has been created
         #: or the previous game has ended.
@@ -100,13 +103,28 @@ class Chess(gym.Env):
             raise ValueError(
                 f"Illegal move {action} for board position {self._board.fen()}"
             )
-
+        board_before = self._board.copy(stack=False)
         self._board.push(action)
+        board_after = self._board
+        self.move_count += 1
+
+        reward_terminal = self._reward()
+        terminated = board_after.is_game_over()
+        truncated = False
+
+        if not terminated:
+            reward_shaping = self.shaper.shaped_reward(
+                board_before,
+                board_after,
+                action,
+                self.move_count
+            )
+        else:
+            reward_shaping = 0.0
+
+        reward = reward_terminal + reward_shaping
 
         observation = self._observation()
-        reward = self._reward()
-        terminated = self._board.is_game_over()
-        truncated = False
         info = {
             "fen": self._board.fen(),
             "result": self._board.result(),
