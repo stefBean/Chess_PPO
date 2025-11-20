@@ -2,11 +2,19 @@
 
 import numpy as np
 import torch
+import subprocess
+import webbrowser
+import time
 
 from board_environment import Chess
 from board_encoding import BoardEncoding
 from action_encoding import AlphaZeroActionEncoder
 from ppo import PPO
+from opponent_random import RandomOpponent
+from opponent_heuristic import HeuristicOpponent
+from torch.utils.tensorboard import SummaryWriter
+from datetime import datetime
+from copy import deepcopy
 
 
 def flatten_obs(obs):
@@ -52,10 +60,40 @@ def main():
         device=device,
     )
 
-    max_timesteps = 10000
-    steps_per_update = 2048
+    agent.load("models/ppo_chess")
+    opponent = RandomOpponent()
+    # opponent = HeuristicOpponent()
+
+    max_timesteps = 200000
+    steps_per_update = 4096
     timestep = 0
     episode = 0
+
+    run_name = f"{opponent.__class__.__name__}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+    log_dir = f"runs/{run_name}"
+    writer = SummaryWriter(log_dir=log_dir)
+    hparams = {
+        "learning_rate_actor": 3e-4,
+        "learning_rate_critic": 1e-3,
+        "batch_size": 256,
+        "epochs_per_update": 10,
+        "opponent": opponent.__class__.__name__,
+        "steps_per_update": steps_per_update,
+    }
+    try:
+        # Start TensorBoard as background process
+        tb_process = subprocess.Popen(
+            ["tensorboard", "--logdir", "runs", "--port", "6006"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(2)
+
+        # Auto-open browser tab
+        webbrowser.open("http://localhost:6006")
+
+    except Exception as e:
+        print(f"[WARN] Could not launch TensorBoard automatically: {e}")
 
     while timestep < max_timesteps:
         obs, info = env.reset()
@@ -153,7 +191,14 @@ def main():
             # PPO update condition
             if timestep % steps_per_update == 0:
                 print(f"\nPPO UPDATE @ timestep {timestep}, episode {episode}")
-                agent.update()
+                metrics = agent.update()
+
+                # Log to TensorBoard
+                writer.add_scalar("Loss/actor", metrics["actor_loss"], timestep)
+                writer.add_scalar("Loss/critic", metrics["critic_loss"], timestep)
+                writer.add_scalar("Loss/entropy", metrics["entropy"], timestep)
+                writer.add_scalar("Timesteps/timestep", timestep, timestep)
+                writer.flush()
 
             if timestep >= max_timesteps:
                 done = True
@@ -161,8 +206,21 @@ def main():
 
         episode += 1
         print(f"Episode {episode} | Return={ep_reward:.2f} | Length={ep_len}")
+        writer.add_scalar("Episode/return", ep_reward, episode)
+        writer.add_scalar("Episode/length", ep_len, episode)
 
     print("Training finished.")
+    writer.add_hparams(
+        hparams,
+        {
+            "final_return": ep_reward,
+            "final_length": ep_len,
+            "actor_loss_last": metrics["actor_loss"],
+            "critic_loss_last": metrics["critic_loss"],
+        }
+    )
+    writer.close()
+    agent.save("models/ppo_chess")
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import os
 from torch.distributions import Categorical
 from torch.optim import Adam
 
@@ -179,3 +180,43 @@ class PPO:
                 self.optim_critic.step()
 
         self.buffer.clear()
+        return {
+            "actor_loss": actor_loss.item(),
+            "critic_loss": critic_loss.item(),
+            "entropy": entropy.item(),
+        }
+
+    # ==========================================================
+    # Save & Load with auto-directory creation
+    # ==========================================================
+    def save(self, path_prefix: str = "models/ppo_chess"):
+        directory = os.path.dirname(path_prefix)
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory, exist_ok=True)
+            print(f"[INFO] Created directory: {directory}")
+
+        actor_path = f"{path_prefix}_actor.pt"
+        critic_path = f"{path_prefix}_critic.pt"
+
+        torch.save(self.actor.state_dict(), actor_path)
+        torch.save(self.critic.state_dict(), critic_path)
+
+        print(f"[INFO] Saved actor to  {actor_path}")
+        print(f"[INFO] Saved critic to {critic_path}")
+
+    def load(self, path_prefix: str = "models/ppo_chess", strict: bool = True):
+        import os
+
+        actor_path = f"{path_prefix}_actor.pt"
+        critic_path = f"{path_prefix}_critic.pt"
+
+        if not os.path.exists(actor_path) or not os.path.exists(critic_path):
+            print(f"[WARN] No saved model found at: {path_prefix}_*.pt")
+            return False
+
+        self.actor.load_state_dict(torch.load(actor_path), strict=strict)
+        self.critic.load_state_dict(torch.load(critic_path), strict=strict)
+
+        print(f"[INFO] Loaded actor from  {actor_path}")
+        print(f"[INFO] Loaded critic from {critic_path}")
+        return True
