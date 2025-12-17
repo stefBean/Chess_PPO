@@ -12,25 +12,13 @@ from action_encoding import AlphaZeroActionEncoder
 from ppo import PPO
 from opponent_random import RandomOpponent
 from opponent_heuristic import HeuristicOpponent
+from opponent_selfplay import SelfPlayOpponent, build_action_map
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
-from copy import deepcopy
 
 
 def flatten_obs(obs):
     return obs.astype(np.float32).ravel()  # (2240,)
-
-
-def move_requires_promotion(board, move):
-    """Return True if a pawn moves into last rank and must promote."""
-    piece = board.piece_at(move.from_square)
-    if piece is None or piece.piece_type != 1:  # not a pawn
-        return False
-
-    to_rank = move.to_square // 8
-    if (piece.color and to_rank == 7) or (not piece.color and to_rank == 0):
-        return True
-    return False
 
 
 def main():
@@ -60,16 +48,27 @@ def main():
         device=device,
     )
 
-    agent.load("models/ppo_chess")
-    opponent = RandomOpponent()
-    # opponent = HeuristicOpponent()
-
     max_timesteps = 200000
     steps_per_update = 4096
     timestep = 0
     episode = 0
 
-    run_name = f"{opponent.__class__.__name__}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+    agent.load("models/ppo_chess")
+
+    # Choose how the agent learns: against a static opponent or via self-play.
+    use_self_play = True
+    opponent = RandomOpponent()
+    # opponent = HeuristicOpponent()
+    self_play_opponent = SelfPlayOpponent(
+        agent_actor=agent.actor,
+        encoder=encoder,
+        flatten_obs=flatten_obs,
+        device=agent.device,
+        refresh_interval=steps_per_update * 2,
+    )
+
+    opponent_name = "SelfPlay" if use_self_play else opponent.__class__.__name__
+    run_name = f"{opponent_name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
     log_dir = f"runs/{run_name}"
     writer = SummaryWriter(log_dir=log_dir)
     hparams = {
@@ -77,7 +76,7 @@ def main():
         "learning_rate_critic": 1e-3,
         "batch_size": 256,
         "epochs_per_update": 10,
-        "opponent": opponent.__class__.__name__,
+        "opponent": opponent_name,
         "steps_per_update": steps_per_update,
     }
     try:
@@ -103,31 +102,17 @@ def main():
         ep_reward = 0.0
         ep_len = 0
 
+        # Ensure the frozen self-play opponent periodically syncs with the
+        # learning agent so the sparring partner improves over time.
+        if use_self_play:
+            self_play_opponent.maybe_refresh(agent.actor)
+
         while not done:
             state_np = flatten_obs(obs)
 
-            # ----------------------------------------
-            # BUILD LEGAL MOVES + INDEX MAP
-            # ----------------------------------------
-            legal_moves = list(board.legal_moves)
-            idxs = []
-            idx_to_move = {}
-
-            for mv in legal_moves:
-                # Enforce promotion legality
-                if move_requires_promotion(board, mv) and mv.promotion is None:
-                    # Skip illegal non-promotion pawn move
-                    continue
-
-                try:
-                    idx = encoder.encode(mv, board)
-                    idxs.append(idx)
-                    idx_to_move[idx] = mv
-                except:
-                    continue
+            idxs, idx_to_move = build_action_map(board, encoder)
 
             if not idxs:
-                # No legal moves => end episode
                 reward = -1.0
                 done = True
                 agent.store_transition(
@@ -141,59 +126,61 @@ def main():
                 )
                 break
 
-            # Build mask: 1.0 where legal, 0.0 otherwise
             legal_mask_np = np.zeros(action_dim, dtype=np.float32)
             legal_mask_np[idxs] = 1.0
 
-            # ----------------------------------------
-            # CHOOSE ACTION THROUGH PPO WITH MASK
-            # ----------------------------------------
             action_id, logprob, value = agent.select_action(state_np, legal_mask_np)
+            move = idx_to_move.get(action_id, np.random.choice(list(board.legal_moves)))
 
-            # Map selected action to legal move
-            if action_id not in idx_to_move:
-                # Very rare fallback: sample a legal move directly
-                move = np.random.choice(legal_moves)
-            else:
-                move = idx_to_move[action_id]
-
-            # Final safety check
             if move not in board.legal_moves:
                 print("ILLEGAL MOVE PRODUCED:", move.uci())
                 print("Board FEN:", board.fen())
                 print("Legal moves:", [m.uci() for m in board.legal_moves])
                 raise SystemExit("Stopping due to masking/encoding mismatch")
 
-            # ----------------------------------------
-            # STEP ENVIRONMENT
-            # ----------------------------------------
-            obs_next, reward, terminated, truncated, info = env.step(move)
+            obs_next, reward_agent, terminated, truncated, info = env.step(move)
             done = terminated or truncated
 
-            # Store transition
+            ep_reward += reward_agent
+            ep_len += 1
+
+            # Opponent (self-play) move before storing transition so the reward
+            # reflects the full ply outcome.
+            combined_reward = reward_agent
+            if not done:
+                if use_self_play:
+                    opp_move, _ = self_play_opponent.select_move(board, obs_next)
+                else:
+                    opp_move = opponent.choose_move(board)
+
+                if opp_move is None:
+                    done = True
+                    combined_reward = reward_agent + 1.0
+                else:
+                    obs_after_opp, reward_opp, terminated_opp, truncated_opp, info = env.step(opp_move)
+                    combined_reward += reward_opp
+                    ep_reward += reward_opp
+                    done = terminated_opp or truncated_opp
+                    obs_next = obs_after_opp
+
             agent.store_transition(
                 state_np,
                 action_id,
                 logprob,
-                reward,
+                combined_reward,
                 done,
                 value,
                 legal_mask_np,
             )
 
-            ep_reward += reward
-            ep_len += 1
             timestep += 1
-
             obs = obs_next
             board = base_env._board
 
-            # PPO update condition
             if timestep % steps_per_update == 0:
                 print(f"\nPPO UPDATE @ timestep {timestep}, episode {episode}")
                 metrics = agent.update()
 
-                # Log to TensorBoard
                 writer.add_scalar("Loss/actor", metrics["actor_loss"], timestep)
                 writer.add_scalar("Loss/critic", metrics["critic_loss"], timestep)
                 writer.add_scalar("Loss/entropy", metrics["entropy"], timestep)
