@@ -15,16 +15,27 @@ from opponent_heuristic import HeuristicOpponent
 from opponent_selfplay import SelfPlayOpponent, build_action_map
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
-
+from copy import deepcopy
 
 def flatten_obs(obs):
     return obs.astype(np.float32).ravel()  # (2240,)
 
+def move_requires_promotion(board, move):
+    """Return True if a pawn moves into last rank and must promote."""
+    piece = board.piece_at(move.from_square)
+    if piece is None or piece.piece_type != 1:  # not a pawn
+        return False
+
+    to_rank = move.to_square // 8
+    if (piece.color and to_rank == 7) or (not piece.color and to_rank == 0):
+        return True
+    return False
 
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    base_env = Chess()
+    # base_env = Chess()
+    base_env = Chess(start_mode="endgame", endgame_max_extra_per_side=3)
     env = BoardEncoding(base_env, history_length=2)
     encoder = AlphaZeroActionEncoder()
 
@@ -48,11 +59,16 @@ def main():
         device=device,
     )
 
-    max_timesteps = 200000
-    steps_per_update = 4096
+    #agent.load("models/ppo_chess")
+    #opponent = RandomOpponent()
+    # opponent = HeuristicOpponent()
+
+    max_timesteps = 500 #200000
+    steps_per_update = 256 #4096
     timestep = 0
     episode = 0
 
+    #run_name = f"{opponent.__class__.__name__}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
     agent.load("models/ppo_chess")
 
     # Choose how the agent learns: against a static opponent or via self-play.
@@ -110,7 +126,27 @@ def main():
         while not done:
             state_np = flatten_obs(obs)
 
-            idxs, idx_to_move = build_action_map(board, encoder)
+            # ----------------------------------------
+            # BUILD LEGAL MOVES + INDEX MAP
+            # ----------------------------------------
+            legal_moves = list(board.legal_moves)
+            idxs = []
+            idx_to_move = {}
+
+            for mv in legal_moves:
+                # Enforce promotion legality
+                if move_requires_promotion(board, mv) and mv.promotion is None:
+                    # Skip illegal non-promotion pawn move
+                    continue
+
+                try:
+                    idx = encoder.encode(mv, board)
+                    idxs.append(idx)
+                    idx_to_move[idx] = mv
+                except:
+                    continue
+
+            # idxs, idx_to_move = build_action_map(board, encoder)
 
             if not idxs:
                 reward = -1.0
@@ -131,13 +167,23 @@ def main():
 
             action_id, logprob, value = agent.select_action(state_np, legal_mask_np)
             move = idx_to_move.get(action_id, np.random.choice(list(board.legal_moves)))
+            # Map selected action to legal move
+            if action_id not in idx_to_move:
+                # Very rare fallback: sample a legal move directly
+                move = np.random.choice(legal_moves)
+            else:
+                move = idx_to_move[action_id]
 
+            # Final safety check
             if move not in board.legal_moves:
                 print("ILLEGAL MOVE PRODUCED:", move.uci())
                 print("Board FEN:", board.fen())
                 print("Legal moves:", [m.uci() for m in board.legal_moves])
                 raise SystemExit("Stopping due to masking/encoding mismatch")
 
+            # ----------------------------------------
+            # STEP ENVIRONMENT
+            # ----------------------------------------
             obs_next, reward_agent, terminated, truncated, info = env.step(move)
             done = terminated or truncated
 
@@ -173,6 +219,8 @@ def main():
                 legal_mask_np,
             )
 
+            ep_reward += combined_reward
+            ep_len += 1
             timestep += 1
             obs = obs_next
             board = base_env._board

@@ -9,6 +9,7 @@ This module contains a basic `Chess` environment. It relies heavily on the
 from typing import Tuple, Optional, Dict, List
 from reward_shaping import RewardShaper
 
+import random
 import chess
 import gymnasium as gym
 
@@ -53,6 +54,8 @@ class Chess(gym.Env):
 
         Note: Surrendering is not an option.
 
+    UPDATE 20.12.25 - Endgame learning only to maximize learning curve of agent without the need of a full game due to hardware capacities
+
     """
 
     # We deliberately use the render mode 'unicode' instead of the canonical
@@ -74,11 +77,14 @@ class Chess(gym.Env):
         '0-1': -1.0,  # Black wins
     }
 
-    def __init__(self) -> None:
+    def __init__(self, start_mode: str = "standard", endgame_max_extra_per_side: int = 3) -> None:
+    # def __init__(self) -> None:
         #: The underlying chess.Board instance that represents the game.
         self._board: Optional[chess.Board] = None
         self.shaper = RewardShaper()
         self.move_count = 0
+        self.start_mode = start_mode
+        self.endgame_max_extra_per_side = endgame_max_extra_per_side
 
         #: Indicates whether the env has been reset since it has been created
         #: or the previous game has ended.
@@ -90,7 +96,14 @@ class Chess(gym.Env):
             np.random.seed(seed)
             random.seed(seed)
 
-        self._board = chess.Board()
+        # self._board = chess.Board()
+        self.move_count = 0
+
+        if self.start_mode == "endgame":
+            self._board = self._generate_endgame_board()
+        else:
+            self._board = chess.Board()
+
         self._ready = True
         info = {}
         return self._observation(), info
@@ -174,6 +187,104 @@ class Chess(gym.Env):
         reward = Chess._rewards[result]
 
         return reward
+
+    # ------------------------------------------------------------------
+    # Endgame initialization helpers
+    # ------------------------------------------------------------------
+    def _generate_endgame_board(self) -> chess.Board:
+        """Create a random endgame position for self-play training.
+
+        The generator limits material to a handful of pieces per side to
+        focus the agent on converting endgame advantages. Boards that are
+        immediately terminal (checkmate, stalemate, insufficient material) are
+        discarded to ensure the agent always has to make at least one move.
+        """
+
+        max_attempts = 100
+        piece_pool = [
+            chess.QUEEN,
+            chess.ROOK,
+            chess.BISHOP,
+            chess.KNIGHT,
+            chess.PAWN,
+        ]
+
+        for _ in range(max_attempts):
+            board = chess.Board(None)
+
+            white_king = random.choice(chess.SQUARES)
+            black_candidates = [
+                sq for sq in chess.SQUARES
+                if sq != white_king and chess.square_distance(sq, white_king) > 1
+            ]
+            if not black_candidates:
+                continue
+            black_king = random.choice(black_candidates)
+
+            board.set_piece_at(white_king, chess.Piece(chess.KING, chess.WHITE))
+            board.set_piece_at(black_king, chess.Piece(chess.KING, chess.BLACK))
+
+            occupied = {white_king, black_king}
+            total_extra = 0
+
+            for color in (chess.WHITE, chess.BLACK):
+                extras = random.randint(1, self.endgame_max_extra_per_side)
+                for _ in range(extras):
+                    piece_type = random.choice(piece_pool)
+                    square = self._sample_square(board, occupied, piece_type, color)
+                    if square is None:
+                        continue
+                    board.set_piece_at(square, chess.Piece(piece_type, color))
+                    occupied.add(square)
+                    total_extra += 1
+
+            # Require at least one non-king piece to avoid trivial king vs king
+            if total_extra == 0:
+                continue
+
+            board.turn = random.choice([chess.WHITE, chess.BLACK])
+
+            if not board.is_valid():
+                continue
+            if board.is_checkmate() or board.is_stalemate() or board.is_insufficient_material():
+                continue
+
+            # Ensure at least one legal move exists for the side to play
+            if any(True for _ in board.legal_moves):
+                return board
+
+        raise RuntimeError("Failed to generate a valid endgame board after many attempts")
+
+    def _sample_square(
+        self,
+        board: chess.Board,
+        occupied: set,
+        piece_type: chess.PieceType,
+        color: chess.Color,
+    ) -> Optional[int]:
+        """Choose a random legal square for the given piece type."""
+
+        candidates = []
+        for sq in chess.SQUARES:
+            if sq in occupied:
+                continue
+            if piece_type == chess.PAWN:
+                rank = chess.square_rank(sq)
+                if rank in (0, 7):
+                    continue
+            candidates.append(sq)
+
+        if not candidates:
+            return None
+
+        random.shuffle(candidates)
+        for sq in candidates:
+            board.set_piece_at(sq, chess.Piece(piece_type, color))
+            if board.is_valid():
+                return sq
+            board.remove_piece_at(sq)
+
+        return None
 
     def _repr_svg_(self) -> str:
         """Returns an SVG representation of the current board position"""
