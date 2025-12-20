@@ -19,18 +19,20 @@ class RolloutBuffer:
         self.rewards = []
         self.dones = []
         self.values = []
+        self.next_values = []
         self.masks = []  # legal action masks
 
     def clear(self):
         self.__init__()
 
-    def add(self, state, action, logprob, reward, done, value, mask):
+    def add(self, state, action, logprob, reward, done, value, next_value, mask):
         self.states.append(state)
         self.actions.append(action)
         self.logprobs.append(logprob)
         self.rewards.append(reward)
         self.dones.append(done)
         self.values.append(value)
+        self.next_values.append(next_value)
         self.masks.append(mask)
 
 
@@ -97,29 +99,40 @@ class PPO:
         reward: float,
         done: bool,
         value: float,
+        next_value: float,
         legal_mask_np: np.ndarray,
     ):
         self.buffer.add(
-            state_np, action, logprob, reward, done, value, legal_mask_np
+            state_np, action, logprob, reward, done, value, next_value, legal_mask_np
         )
+
+    def evaluate_value(self, state_np: np.ndarray) -> float:
+        state = torch.from_numpy(state_np).float().to(self.device).unsqueeze(0)
+        with torch.no_grad():
+            value = self.critic(state).squeeze(-1)
+        return float(value.item())
 
     # --------------------------------------------------
     # GAE(λ)
     # --------------------------------------------------
-    def compute_gae(self, rewards, dones, values):
+    def compute_gae(self, rewards, dones, values, next_values):
         rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
         dones = torch.tensor(dones, dtype=torch.float32, device=self.device)
         values = torch.tensor(values, dtype=torch.float32, device=self.device)
+        next_values = torch.tensor(next_values, dtype=torch.float32, device=self.device)
 
         advantages = torch.zeros_like(rewards, device=self.device)
         gae = 0.0
 
         # Bootstrap with an extra value=0
-        values_ext = torch.cat([values, torch.tensor([0.0], device=self.device)], dim=0)
+        # values_ext = torch.cat([values, torch.tensor([0.0], device=self.device)], dim=0)
 
         for t in reversed(range(len(rewards))):
-            delta = rewards[t] + self.gamma * values_ext[t + 1] * (1.0 - dones[t]) - values_ext[t]
-            gae = delta + self.gamma * self.gae_lambda * (1.0 - dones[t]) * gae
+            # delta = rewards[t] + self.gamma * values_ext[t + 1] * (1.0 - dones[t]) - values_ext[t]
+            # gae = delta + self.gamma * self.gae_lambda * (1.0 - dones[t]) * gae
+            mask = 1.0 - dones[t]
+            delta = rewards[t] + self.gamma * next_values[t] * mask - values[t]
+            gae = delta + self.gamma * self.gae_lambda * mask * gae
             advantages[t] = gae
 
         returns = advantages + values
@@ -135,9 +148,10 @@ class PPO:
         rewards = np.array(self.buffer.rewards, dtype=np.float32)
         dones = np.array(self.buffer.dones, dtype=np.float32)
         values = np.array(self.buffer.values, dtype=np.float32)
+        next_values = np.array(self.buffer.next_values, dtype=np.float32)
         masks = torch.tensor(np.array(self.buffer.masks), dtype=torch.float32, device=self.device)
 
-        advantages, returns = self.compute_gae(rewards, dones, values)
+        advantages, returns = self.compute_gae(rewards, dones, values, next_values)
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         dataset_size = states.size(0)

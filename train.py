@@ -187,6 +187,7 @@ def main():
                     reward,
                     done,
                     0.0,
+                    0.0,
                     np.zeros(action_dim, dtype=np.float32),
                 )
                 break
@@ -216,12 +217,11 @@ def main():
             obs_next, reward_agent, terminated, truncated, info = env.step(move)
             done = terminated or truncated
 
-            ep_reward += reward_agent
-            ep_len += 1
-
             # Opponent (self-play) move before storing transition so the reward
             # reflects the full ply outcome.
             combined_reward = reward_agent
+            ep_reward += reward_agent
+            ep_len += 1
             if not done:
                 #if use_self_play:
                 opp_move, _ = self_play_opponent.select_move(board, obs_next)
@@ -235,8 +235,15 @@ def main():
                     obs_after_opp, reward_opp, terminated_opp, truncated_opp, info = env.step(opp_move)
                     combined_reward += reward_opp
                     ep_reward += reward_opp
+                    ep_len += 1
                     done = terminated_opp or truncated_opp
                     obs_next = obs_after_opp
+
+            # Bootstrap value for the next state to stabilize advantage estimates.
+            next_value = 0.0
+            if not done:
+                next_state_np = flatten_obs(obs_next)
+                next_value = agent.evaluate_value(next_state_np)
 
             agent.store_transition(
                 state_np,
@@ -245,11 +252,12 @@ def main():
                 combined_reward,
                 done,
                 value,
+                next_value,
                 legal_mask_np,
             )
 
-            ep_reward += combined_reward
-            ep_len += 1
+            # ep_reward += combined_reward
+            # ep_len += 1
             timestep += 1
             obs = obs_next
             board = base_env._board
