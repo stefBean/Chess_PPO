@@ -12,7 +12,7 @@ from action_encoding import AlphaZeroActionEncoder
 from ppo import PPO
 from opponent_random import RandomOpponent
 from opponent_heuristic import HeuristicOpponent
-from opponent_selfplay import SelfPlayOpponent, build_action_map
+from opponent_selfplay import SelfPlayOpponent, build_action_map, OpponentPool
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
 from copy import deepcopy
@@ -31,11 +31,22 @@ def move_requires_promotion(board, move):
         return True
     return False
 
+
+
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # base_env = Chess()
-    base_env = Chess(start_mode="endgame", endgame_max_extra_per_side=3)
+    # base_env = Chess(start_mode="endgame", endgame_max_extra_per_side=3)
+    # env = BoardEncoding(base_env, history_length=2)
+    # Start games from random endgame positions to focus learning on
+    # conversion/defense scenarios.
+    base_env = Chess(
+        start_mode="endgame",
+        endgame_max_extra_per_side=4,
+        endgame_min_extra_total=2,
+        require_pawn=True,
+    )
     env = BoardEncoding(base_env, history_length=2)
     encoder = AlphaZeroActionEncoder()
 
@@ -54,46 +65,58 @@ def main():
         gamma=0.99,
         gae_lambda=0.95,
         clip_eps=0.2,
-        epochs=4,
-        minibatch_size=256,
+        epochs=6,
+        minibatch_size=512,
         device=device,
+        entropy_coef=0.02,
+        value_coef=0.6,
+        max_grad_norm=0.7,
     )
 
     #agent.load("models/ppo_chess")
     #opponent = RandomOpponent()
     # opponent = HeuristicOpponent()
-
-    max_timesteps = 500 #200000
-    steps_per_update = 256 #4096
+    opponent_pool = OpponentPool(max_size=8, p_latest=0.7, seed=0)
+    max_timesteps = 500000 #200000 #500
+    steps_per_update = 8192 #4096 #256 #
     timestep = 0
     episode = 0
 
     #run_name = f"{opponent.__class__.__name__}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
-    agent.load("models/ppo_chess")
+    agent.load("models/ppo_chess", strict=False)
 
     # Choose how the agent learns: against a static opponent or via self-play.
     use_self_play = True
-    opponent = RandomOpponent()
+    # opponent = RandomOpponent()
     # opponent = HeuristicOpponent()
     self_play_opponent = SelfPlayOpponent(
         agent_actor=agent.actor,
         encoder=encoder,
         flatten_obs=flatten_obs,
         device=agent.device,
-        refresh_interval=steps_per_update * 2,
+        refresh_interval=steps_per_update,
+        pool_size=6,
+        sample_past_prob=0.4,
+        temperature=1.05,
     )
 
-    opponent_name = "SelfPlay" if use_self_play else opponent.__class__.__name__
+    opponent_pool.add(agent.actor)
+    update_count = 0
+    snapshot_every = 10
+    opponent_name = "SelfPlay" #if use_self_play else opponent.__class__.__name__
     run_name = f"{opponent_name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
     log_dir = f"runs/{run_name}"
     writer = SummaryWriter(log_dir=log_dir)
     hparams = {
         "learning_rate_actor": 3e-4,
         "learning_rate_critic": 1e-3,
-        "batch_size": 256,
-        "epochs_per_update": 10,
+        "batch_size": 512,
+        "epochs_per_update": 6,
         "opponent": opponent_name,
         "steps_per_update": steps_per_update,
+        "entropy_coef": 0.02,
+        "value_coef": 0.6,
+        "selfplay_snapshot_pool": 6,
     }
     try:
         # Start TensorBoard as background process
@@ -114,6 +137,11 @@ def main():
         obs, info = env.reset()
         board = base_env._board
         done = False
+        agent_color = board.turn  # chess.WHITE or chess.BLACK; fixed for this episode
+
+        if use_self_play:
+            snap = opponent_pool.sample()
+            self_play_opponent.load_snapshot(snap)
 
         ep_reward = 0.0
         ep_len = 0
@@ -121,7 +149,8 @@ def main():
         # Ensure the frozen self-play opponent periodically syncs with the
         # learning agent so the sparring partner improves over time.
         if use_self_play:
-            self_play_opponent.maybe_refresh(agent.actor)
+            #self_play_opponent.maybe_refresh(agent.actor, timestep)
+            self_play_opponent.begin_episode()
 
         while not done:
             state_np = flatten_obs(obs)
@@ -194,10 +223,10 @@ def main():
             # reflects the full ply outcome.
             combined_reward = reward_agent
             if not done:
-                if use_self_play:
-                    opp_move, _ = self_play_opponent.select_move(board, obs_next)
-                else:
-                    opp_move = opponent.choose_move(board)
+                #if use_self_play:
+                opp_move, _ = self_play_opponent.select_move(board, obs_next)
+                #else:
+                   # opp_move = opponent.choose_move(board)
 
                 if opp_move is None:
                     done = True

@@ -47,6 +47,9 @@ class PPO:
         epochs: int = 10,
         minibatch_size: int = 64,
         device: str = "cpu",
+        entropy_coef: float=0.02,
+        value_coef: float=0.5,
+        max_grad_norm: float =0.5,
     ):
         self.device = torch.device(device)
         self.gamma = gamma
@@ -54,6 +57,9 @@ class PPO:
         self.clip_eps = clip_eps
         self.epochs = epochs
         self.minibatch_size = minibatch_size
+        self.entropy_coef = entropy_coef
+        self.value_coef = value_coef
+        self.max_grad_norm = max_grad_norm
 
         self.actor = Actor(state_dim, action_dim).to(self.device)
         self.critic = Critic(state_dim).to(self.device)
@@ -169,13 +175,20 @@ class PPO:
 
                 # Entropy bonus
                 entropy = dist.entropy().mean()
-                loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy
+                # loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy
+                loss = (
+                        actor_loss
+                        + self.value_coef * critic_loss
+                        - self.entropy_coef * entropy
+                )
 
                 self.optim_actor.zero_grad()
                 self.optim_critic.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
-                nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
+                # nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
+                # nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
+                nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+                nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
                 self.optim_actor.step()
                 self.optim_critic.step()
 
@@ -184,6 +197,7 @@ class PPO:
             "actor_loss": actor_loss.item(),
             "critic_loss": critic_loss.item(),
             "entropy": entropy.item(),
+            "entropy_coef": float(self.entropy_coef),
         }
 
     # ==========================================================

@@ -77,7 +77,14 @@ class Chess(gym.Env):
         '0-1': -1.0,  # Black wins
     }
 
-    def __init__(self, start_mode: str = "standard", endgame_max_extra_per_side: int = 3) -> None:
+    def __init__(
+            self,
+            start_mode: str = "standard",
+            endgame_max_extra_per_side: int = 3,
+            endgame_min_extra_total: int = 2,
+            require_pawn: bool = True,
+            require_material_edge: bool = True,
+    ) -> None:
     # def __init__(self) -> None:
         #: The underlying chess.Board instance that represents the game.
         self._board: Optional[chess.Board] = None
@@ -85,6 +92,9 @@ class Chess(gym.Env):
         self.move_count = 0
         self.start_mode = start_mode
         self.endgame_max_extra_per_side = endgame_max_extra_per_side
+        self.endgame_min_extra_total = endgame_min_extra_total
+        self.require_pawn = require_pawn
+        self.require_material_edge = require_material_edge
 
         #: Indicates whether the env has been reset since it has been created
         #: or the previous game has ended.
@@ -208,6 +218,13 @@ class Chess(gym.Env):
             chess.KNIGHT,
             chess.PAWN,
         ]
+        material_values = {
+            chess.PAWN: 1,
+            chess.KNIGHT: 3,
+            chess.BISHOP: 3,
+            chess.ROOK: 5,
+            chess.QUEEN: 9,
+        }
 
         for _ in range(max_attempts):
             board = chess.Board(None)
@@ -226,6 +243,7 @@ class Chess(gym.Env):
 
             occupied = {white_king, black_king}
             total_extra = 0
+            placed_pawn = False
 
             for color in (chess.WHITE, chess.BLACK):
                 extras = random.randint(1, self.endgame_max_extra_per_side)
@@ -237,9 +255,14 @@ class Chess(gym.Env):
                     board.set_piece_at(square, chess.Piece(piece_type, color))
                     occupied.add(square)
                     total_extra += 1
+                    if piece_type == chess.PAWN:
+                        placed_pawn = True
 
             # Require at least one non-king piece to avoid trivial king vs king
-            if total_extra == 0:
+            if total_extra < self.endgame_min_extra_total:
+                continue
+
+            if self.require_pawn and not placed_pawn:
                 continue
 
             board.turn = random.choice([chess.WHITE, chess.BLACK])
@@ -249,6 +272,16 @@ class Chess(gym.Env):
             if board.is_checkmate() or board.is_stalemate() or board.is_insufficient_material():
                 continue
 
+            if self.require_material_edge:
+                balance = 0
+                for square, piece in board.piece_map().items():
+                    if piece.piece_type not in material_values:
+                        continue
+                    value = material_values[piece.piece_type]
+                    balance += value if piece.color == chess.WHITE else -value
+                if abs(balance) < 1:
+                    continue
+
             # Ensure at least one legal move exists for the side to play
             if any(True for _ in board.legal_moves):
                 return board
@@ -256,11 +289,11 @@ class Chess(gym.Env):
         raise RuntimeError("Failed to generate a valid endgame board after many attempts")
 
     def _sample_square(
-        self,
-        board: chess.Board,
-        occupied: set,
-        piece_type: chess.PieceType,
-        color: chess.Color,
+            self,
+            board: chess.Board,
+            occupied: set,
+            piece_type: chess.PieceType,
+            color: chess.Color,
     ) -> Optional[int]:
         """Choose a random legal square for the given piece type."""
 
