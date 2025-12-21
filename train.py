@@ -43,8 +43,8 @@ def main():
     # conversion/defense scenarios.
     base_env = Chess(
         start_mode="endgame",
-        endgame_max_extra_per_side=4,
-        endgame_min_extra_total=2,
+        endgame_max_extra_per_side=3,
+        endgame_min_extra_total=1,
         require_pawn=True,
     )
     env = BoardEncoding(base_env, history_length=2)
@@ -65,22 +65,30 @@ def main():
         gamma=0.99,
         gae_lambda=0.95,
         clip_eps=0.2,
-        epochs=6,
-        minibatch_size=512,
+        epochs=5,
+        minibatch_size=384,
         device=device,
-        entropy_coef=0.02,
-        value_coef=0.6,
-        max_grad_norm=0.7,
+        entropy_coef=0.03,
+        value_coef=0.65,
+        max_grad_norm=0.6,
+        value_clip=0.25,
+        target_kl=0.015,
+        reward_scale=0.85,
+        reward_clip=2.5,
     )
 
     #agent.load("models/ppo_chess")
     #opponent = RandomOpponent()
     # opponent = HeuristicOpponent()
     opponent_pool = OpponentPool(max_size=8, p_latest=0.7, seed=0)
-    max_timesteps = 500000 #200000 #500
-    steps_per_update = 8192 #4096 #256 #
+    max_timesteps = 400000 #200000 #500
+    steps_per_update = 6144 #4096 #256 #
     timestep = 0
     episode = 0
+    entropy_coef = agent.entropy_coef
+    entropy_coef_min = 0.005
+    entropy_decay = 0.97
+    smoothed_return = None
 
     #run_name = f"{opponent.__class__.__name__}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
     agent.load("models/ppo_chess", strict=False)
@@ -110,13 +118,16 @@ def main():
     hparams = {
         "learning_rate_actor": 3e-4,
         "learning_rate_critic": 1e-3,
-        "batch_size": 512,
-        "epochs_per_update": 6,
+        "batch_size": 384,
+        "epochs_per_update": 5,
         "opponent": opponent_name,
         "steps_per_update": steps_per_update,
-        "entropy_coef": 0.02,
-        "value_coef": 0.6,
+        "entropy_coef_init": 0.03,
+        "entropy_coef_min": entropy_coef_min,
+        "value_coef": 0.65,
         "selfplay_snapshot_pool": 6,
+        "target_kl": 0.015,
+        "reward_scale": 0.85,
     }
     try:
         # Start TensorBoard as background process
@@ -265,10 +276,15 @@ def main():
             if timestep % steps_per_update == 0:
                 print(f"\nPPO UPDATE @ timestep {timestep}, episode {episode}")
                 metrics = agent.update()
+                entropy_coef = max(entropy_coef_min, entropy_coef * entropy_decay)
+                agent.entropy_coef = entropy_coef
 
                 writer.add_scalar("Loss/actor", metrics["actor_loss"], timestep)
                 writer.add_scalar("Loss/critic", metrics["critic_loss"], timestep)
                 writer.add_scalar("Loss/entropy", metrics["entropy"], timestep)
+                writer.add_scalar("Loss/entropy_coef", entropy_coef, timestep)
+                writer.add_scalar("KL/approx_kl", metrics["approx_kl"], timestep)
+                writer.add_scalar("Optimization/minibatches", metrics["updates_run"], timestep)
                 writer.add_scalar("Timesteps/timestep", timestep, timestep)
                 writer.flush()
 
@@ -278,7 +294,12 @@ def main():
 
         episode += 1
         print(f"Episode {episode} | Return={ep_reward:.2f} | Length={ep_len}")
+        if smoothed_return is None:
+            smoothed_return = ep_reward
+        else:
+            smoothed_return = 0.9 * smoothed_return + 0.1 * ep_reward
         writer.add_scalar("Episode/return", ep_reward, episode)
+        writer.add_scalar("Episode/return_smooth", smoothed_return, episode)
         writer.add_scalar("Episode/length", ep_len, episode)
 
     print("Training finished.")

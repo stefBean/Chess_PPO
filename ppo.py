@@ -49,9 +49,13 @@ class PPO:
         epochs: int = 10,
         minibatch_size: int = 64,
         device: str = "cpu",
-        entropy_coef: float=0.02,
-        value_coef: float=0.5,
-        max_grad_norm: float =0.5,
+        entropy_coef: float = 0.02,
+        value_coef: float = 0.5,
+        max_grad_norm: float = 0.5,
+        value_clip: float = 0.2,
+        target_kl: float = 0.02,
+        reward_scale: float = 1.0,
+        reward_clip: float | None = 2.0,
     ):
         self.device = torch.device(device)
         self.gamma = gamma
@@ -62,6 +66,10 @@ class PPO:
         self.entropy_coef = entropy_coef
         self.value_coef = value_coef
         self.max_grad_norm = max_grad_norm
+        self.value_clip = value_clip
+        self.target_kl = target_kl
+        self.reward_scale = reward_scale
+        self.reward_clip = reward_clip
 
         self.actor = Actor(state_dim, action_dim).to(self.device)
         self.critic = Critic(state_dim).to(self.device)
@@ -117,6 +125,9 @@ class PPO:
     # --------------------------------------------------
     def compute_gae(self, rewards, dones, values, next_values):
         rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
+        rewards = rewards * self.reward_scale
+        if self.reward_clip is not None:
+            rewards = torch.clamp(rewards, -self.reward_clip, self.reward_clip)
         dones = torch.tensor(dones, dtype=torch.float32, device=self.device)
         values = torch.tensor(values, dtype=torch.float32, device=self.device)
         next_values = torch.tensor(next_values, dtype=torch.float32, device=self.device)
@@ -153,9 +164,12 @@ class PPO:
 
         advantages, returns = self.compute_gae(rewards, dones, values, next_values)
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        old_values = torch.tensor(values, dtype=torch.float32, device=self.device)
 
         dataset_size = states.size(0)
         indices = np.arange(dataset_size)
+        approx_kl = 0.0
+        updates_run = 0
 
         for _ in range(self.epochs):
             np.random.shuffle(indices)
@@ -169,6 +183,7 @@ class PPO:
                 mb_advantages = advantages[mb_idx]
                 mb_returns = returns[mb_idx]
                 mb_masks = masks[mb_idx]
+                mb_old_values = old_values[mb_idx]
 
                 # Actor
                 logits = self.actor(mb_states)
@@ -185,7 +200,16 @@ class PPO:
 
                 # Critic
                 values_pred = self.critic(mb_states).squeeze(-1)
-                critic_loss = torch.mean((mb_returns - values_pred) ** 2)
+                # critic_loss = torch.mean((mb_returns - values_pred) ** 2)
+                value_pred_clipped = mb_old_values + torch.clamp(
+                    values_pred - mb_old_values, -self.value_clip, self.value_clip
+                )
+                critic_loss = torch.mean(
+                    torch.max(
+                        (mb_returns - values_pred) ** 2,
+                        (mb_returns - value_pred_clipped) ** 2,
+                    )
+                )
 
                 # Entropy bonus
                 entropy = dist.entropy().mean()
@@ -206,12 +230,21 @@ class PPO:
                 self.optim_actor.step()
                 self.optim_critic.step()
 
+                approx_kl = torch.mean(mb_old_logprobs - new_logprobs).item()
+                updates_run += 1
+                if self.target_kl and approx_kl > 1.5 * self.target_kl:
+                    break
+            if self.target_kl and approx_kl > 1.5 * self.target_kl:
+                break
+
         self.buffer.clear()
         return {
             "actor_loss": actor_loss.item(),
             "critic_loss": critic_loss.item(),
             "entropy": entropy.item(),
             "entropy_coef": float(self.entropy_coef),
+            "approx_kl": approx_kl,
+            "updates_run": updates_run,
         }
 
     # ==========================================================
