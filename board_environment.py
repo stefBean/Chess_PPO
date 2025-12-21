@@ -80,6 +80,7 @@ class Chess(gym.Env):
     def __init__(
             self,
             start_mode: str = "standard",
+            endgame_scenarios: Optional[List[Dict[str, List[chess.PieceType]]]] = None,
             endgame_max_extra_per_side: int = 3,
             endgame_min_extra_total: int = 2,
             require_pawn: bool = True,
@@ -91,16 +92,19 @@ class Chess(gym.Env):
         self.shaper = RewardShaper()
         self.move_count = 0
         self.start_mode = start_mode
+        self.endgame_scenarios = endgame_scenarios
         self.endgame_max_extra_per_side = endgame_max_extra_per_side
         self.endgame_min_extra_total = endgame_min_extra_total
         self.require_pawn = require_pawn
         self.require_material_edge = require_material_edge
+        self.max_ply = 200
+        self.no_progress = 0
 
         #: Indicates whether the env has been reset since it has been created
         #: or the previous game has ended.
         self._ready: bool = False
 
-    def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
+    def reset(self,*, seed=None, options=None):
         if seed is not None:
             import random, numpy as np
             np.random.seed(seed)
@@ -108,9 +112,14 @@ class Chess(gym.Env):
 
         # self._board = chess.Board()
         self.move_count = 0
+        options = options or {}
+        self.max_ply = int(options.get("max_ply", self.max_ply))
+        self.no_progress = 0
 
         if self.start_mode == "endgame":
             self._board = self._generate_endgame_board()
+        elif self.start_mode == "curriculum_endgame":
+            self._board = self._generate_curriculum_endgame_board()
         else:
             self._board = chess.Board()
 
@@ -122,18 +131,41 @@ class Chess(gym.Env):
 
         assert self._ready, "Cannot call env.step() before calling reset()"
 
+
         if action not in self._board.legal_moves:
             raise ValueError(
                 f"Illegal move {action} for board position {self._board.fen()}"
             )
         board_before = self._board.copy(stack=False)
+        mover = board_before.turn
         self._board.push(action)
         board_after = self._board
         self.move_count += 1
+        is_capture = board_before.is_capture(action)
+        moved_piece = board_before.piece_at(action.from_square)
+        is_pawn = (moved_piece is not None and moved_piece.piece_type == chess.PAWN)
+
+        if is_capture or is_pawn:
+            self.no_progress = 0
+        else:
+            self.no_progress += 1
+
+        truncated = False
+        if self.move_count >= self.max_ply:
+            truncated = True
 
         reward_terminal = self._reward()
         terminated = board_after.is_game_over()
-        truncated = False
+        # truncated = False
+        reward_terminal = 0.0
+        if terminated:
+            res = board_after.result()
+            if res == "1-0":
+                reward_terminal = +1.0 if mover == chess.WHITE else -1.0
+            elif res == "0-1":
+                reward_terminal = +1.0 if mover == chess.BLACK else -1.0
+            else:
+                reward_terminal = 0.0
 
         if not terminated:
             reward_shaping = self.shaper.shaped_reward(
@@ -287,6 +319,71 @@ class Chess(gym.Env):
                 return board
 
         raise RuntimeError("Failed to generate a valid endgame board after many attempts")
+
+    def _generate_curriculum_endgame_board(self) -> chess.Board:
+        """Create focused endgame tasks (e.g., K+P vs K, K+B+P vs K)."""
+
+        scenarios = self.endgame_scenarios or [
+            {"white": [chess.KING, chess.PAWN], "black": [chess.KING]},
+            {"white": [chess.KING, chess.BISHOP, chess.PAWN], "black": [chess.KING]},
+            {"white": [chess.KING, chess.KNIGHT, chess.PAWN], "black": [chess.KING]},
+            {"white": [chess.KING, chess.ROOK, chess.PAWN], "black": [chess.KING]},
+            {"white": [chess.KING, chess.QUEEN], "black": [chess.KING, chess.PAWN]},
+            {"white": [chess.KING, chess.ROOK], "black": [chess.KING, chess.PAWN]},
+            {"white": [chess.KING, chess.QUEEN], "black": [chess.KING, chess.ROOK]},
+        ]
+
+        # Also allow mirroring colors for diversity
+        for _ in range(200):
+            scenario = random.choice(scenarios)
+            if random.random() < 0.5:
+                scenario = {"white": scenario["black"], "black": scenario["white"]}
+
+            board = chess.Board(None)
+            occupied = set()
+
+            # Place kings first with distance
+            white_king = random.choice(chess.SQUARES)
+            black_candidates = [
+                sq for sq in chess.SQUARES
+                if sq != white_king and chess.square_distance(sq, white_king) > 1
+            ]
+            if not black_candidates:
+                continue
+            black_king = random.choice(black_candidates)
+
+            board.set_piece_at(white_king, chess.Piece(chess.KING, chess.WHITE))
+            board.set_piece_at(black_king, chess.Piece(chess.KING, chess.BLACK))
+            occupied.update([white_king, black_king])
+
+            if not self._place_piece_set(board, occupied, scenario["white"], chess.WHITE):
+                continue
+            if not self._place_piece_set(board, occupied, scenario["black"], chess.BLACK):
+                continue
+
+            board.turn = random.choice([chess.WHITE, chess.BLACK])
+
+            if not board.is_valid():
+                continue
+            if board.is_checkmate() or board.is_stalemate() or board.is_insufficient_material():
+                continue
+            if any(True for _ in board.legal_moves):
+                return board
+
+        raise RuntimeError("Failed to generate a curriculum endgame board")
+
+    def _place_piece_set(self, board: chess.Board, occupied: set, pieces: List[chess.PieceType],
+                         color: chess.Color) -> bool:
+        """Place the given list of pieces randomly on the board."""
+        for piece_type in pieces:
+            if piece_type == chess.KING:
+                continue
+            square = self._sample_square(board, occupied, piece_type, color)
+            if square is None:
+                return False
+            board.set_piece_at(square, chess.Piece(piece_type, color))
+            occupied.add(square)
+        return True
 
     def _sample_square(
             self,

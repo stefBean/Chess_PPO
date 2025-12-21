@@ -71,7 +71,10 @@ class SelfPlayOpponent:
     def load_snapshot(self, snapshot_state_dict) -> None:
         if snapshot_state_dict is None:
             return
-        self.actor.load_state_dict(snapshot_state_dict, strict=True)
+        snapshot_copy = copy.deepcopy(snapshot_state_dict)
+        self.latest_state = snapshot_copy
+        self.snapshots.append(snapshot_copy)
+        self.opponent_actor.load_state_dict(snapshot_copy, strict=True)
 
     def select_move(
         self, board: chess.Board, observation: np.ndarray

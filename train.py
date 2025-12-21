@@ -1,10 +1,11 @@
 # train.py
-
+import chess
 import numpy as np
 import torch
 import subprocess
 import webbrowser
 import time
+import random
 
 from board_environment import Chess
 from board_encoding import BoardEncoding
@@ -31,6 +32,74 @@ def move_requires_promotion(board, move):
         return True
     return False
 
+def quick_eval_gate(
+    actor,
+    encoder,
+    flatten_obs_fn,
+    device,
+    games: int = 2,
+    max_plies: int = 40,
+    history_length: int = 2,
+):
+    """Lightweight evaluation to decide if a snapshot enters the pool."""
+    base_env = Chess(start_mode="curriculum_endgame", endgame_max_extra_per_side=3)
+    env_eval = BoardEncoding(base_env, history_length=history_length)
+    random_opp = RandomOpponent()
+    total_score = 0.0
+    actor.eval()
+
+    for _ in range(games):
+        obs, _ = env_eval.reset()
+        board = base_env._board
+        done = False
+        plies = 0
+
+        while not done and plies < max_plies:
+            state_np = flatten_obs_fn(obs)
+            idxs, idx_to_move = build_action_map(board, encoder)
+            if not idxs:
+                total_score -= 0.5
+                break
+
+            legal_mask_np = np.zeros(encoder.ACT_DIM, dtype=np.float32)
+            legal_mask_np[idxs] = 1.0
+
+            state = torch.from_numpy(state_np).float().to(device).unsqueeze(0)
+            legal_mask = torch.from_numpy(legal_mask_np).to(device).unsqueeze(0)
+
+            with torch.no_grad():
+                logits = actor(state)
+                masked_logits = logits.masked_fill(legal_mask == 0, -1e9)
+                dist = torch.distributions.Categorical(logits=masked_logits)
+                action = dist.sample()
+
+            move = idx_to_move.get(int(action.item()))
+            if move is None:
+                total_score -= 0.5
+                break
+
+            obs, reward, terminated, truncated, _ = env_eval.step(move)
+            done = terminated or truncated
+            plies += 1
+
+            if done:
+                total_score += reward
+                break
+
+            opp_move = random_opp.choose_move(board)
+            if opp_move is None:
+                total_score += 1.0
+                break
+
+            obs, reward2, terminated, truncated, _ = env_eval.step(opp_move)
+            done = terminated or truncated
+            plies += 1
+
+            if done:
+                total_score += (reward + reward2)
+
+    actor.train()
+    return total_score / max(1, games)
 
 
 def main():
@@ -42,10 +111,10 @@ def main():
     # Start games from random endgame positions to focus learning on
     # conversion/defense scenarios.
     base_env = Chess(
-        start_mode="endgame",
+        start_mode="curriculum_endgame",
         endgame_max_extra_per_side=3,
         endgame_min_extra_total=1,
-        require_pawn=True,
+        require_pawn=False,
     )
     env = BoardEncoding(base_env, history_length=2)
     encoder = AlphaZeroActionEncoder()
@@ -81,6 +150,8 @@ def main():
     #opponent = RandomOpponent()
     # opponent = HeuristicOpponent()
     opponent_pool = OpponentPool(max_size=8, p_latest=0.7, seed=0)
+    fixed_opponents = [("random", RandomOpponent()), ("heuristic", HeuristicOpponent())]
+    fixed_opponent_prob = 0.25
     max_timesteps = 400000 #200000 #500
     steps_per_update = 6144 #4096 #256 #
     timestep = 0
@@ -162,6 +233,9 @@ def main():
         if use_self_play:
             #self_play_opponent.maybe_refresh(agent.actor, timestep)
             self_play_opponent.begin_episode()
+        active_fixed_opponent = None
+        if np.random.rand() < fixed_opponent_prob:
+            active_fixed_opponent = random.choice(fixed_opponents)
 
         while not done:
             state_np = flatten_obs(obs)
@@ -235,10 +309,13 @@ def main():
             ep_len += 1
             if not done:
                 #if use_self_play:
-                opp_move, _ = self_play_opponent.select_move(board, obs_next)
+                # opp_move, _ = self_play_opponent.select_move(board, obs_next)
                 #else:
                    # opp_move = opponent.choose_move(board)
-
+                if active_fixed_opponent is None:
+                    opp_move, _ = self_play_opponent.select_move(board, obs_next)
+                else:
+                    opp_move = active_fixed_opponent[1].choose_move(board)
                 if opp_move is None:
                     done = True
                     combined_reward = reward_agent + 1.0
@@ -276,8 +353,25 @@ def main():
             if timestep % steps_per_update == 0:
                 print(f"\nPPO UPDATE @ timestep {timestep}, episode {episode}")
                 metrics = agent.update()
+                update_count += 1
+
+                if update_count % snapshot_every == 0:
+                    gate_score = quick_eval_gate(agent.actor, encoder, flatten_obs, agent.device)
+                    if gate_score >= -0.05:
+                        opponent_pool.add(agent.actor)
+                        print(
+                            f"[POOL] Added snapshot (gate score={gate_score:.3f}); pool size={len(opponent_pool.snapshots)}")
+                    else:
+                        print(f"[POOL] Skipped snapshot (gate score={gate_score:.3f})")
                 entropy_coef = max(entropy_coef_min, entropy_coef * entropy_decay)
                 agent.entropy_coef = entropy_coef
+                # last_value = 0.0
+                # if not done:
+                #     state_np = flatten_obs(obs).astype(np.float32)
+                #     with torch.no_grad():
+                #         s = torch.from_numpy(state_np).float().to(device).unsqueeze(0)
+                #         last_value = float(agent.critic(s).squeeze(-1).item())
+                # metrics = agent.update(last_value=last_value)
 
                 writer.add_scalar("Loss/actor", metrics["actor_loss"], timestep)
                 writer.add_scalar("Loss/critic", metrics["critic_loss"], timestep)
@@ -293,6 +387,8 @@ def main():
                 break
 
         episode += 1
+        agent_color = np.random.choice([chess.WHITE, chess.BLACK])
+
         print(f"Episode {episode} | Return={ep_reward:.2f} | Length={ep_len}")
         if smoothed_return is None:
             smoothed_return = ep_reward

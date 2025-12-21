@@ -20,7 +20,8 @@ class RolloutBuffer:
         self.dones = []
         self.values = []
         self.next_values = []
-        self.masks = []  # legal action masks
+        self.masks = []
+        self.final_value = 0.0
 
     def clear(self):
         self.__init__()
@@ -34,6 +35,7 @@ class RolloutBuffer:
         self.values.append(value)
         self.next_values.append(next_value)
         self.masks.append(mask)
+        self.final_value = next_value
 
 
 class PPO:
@@ -123,7 +125,7 @@ class PPO:
     # --------------------------------------------------
     # GAE(λ)
     # --------------------------------------------------
-    def compute_gae(self, rewards, dones, values, next_values):
+    def compute_gae(self, rewards, dones, values, next_values, bootstrap_value: float):
         rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
         rewards = rewards * self.reward_scale
         if self.reward_clip is not None:
@@ -142,17 +144,38 @@ class PPO:
             # delta = rewards[t] + self.gamma * values_ext[t + 1] * (1.0 - dones[t]) - values_ext[t]
             # gae = delta + self.gamma * self.gae_lambda * (1.0 - dones[t]) * gae
             mask = 1.0 - dones[t]
-            delta = rewards[t] + self.gamma * next_values[t] * mask - values[t]
+            next_val = bootstrap_value if t == len(rewards) - 1 else next_values[t]
+            delta = rewards[t] + self.gamma * next_val * mask - values[t]
             gae = delta + self.gamma * self.gae_lambda * mask * gae
             advantages[t] = gae
 
         returns = advantages + values
         return advantages, returns
 
+    # def compute_gae(self, rewards, dones, values, last_value: float):
+    #     rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
+    #     dones = torch.tensor(dones, dtype=torch.float32, device=self.device)
+    #     values = torch.tensor(values, dtype=torch.float32, device=self.device)
+    #
+    #     advantages = torch.zeros_like(rewards, device=self.device)
+    #     gae = 0.0
+    #
+    #     # Bootstrap with critic(last_state) instead of 0
+    #     last_v = torch.tensor([last_value], dtype=torch.float32, device=self.device)
+    #     values_ext = torch.cat([values, last_v], dim=0)
+    #
+    #     for t in reversed(range(len(rewards))):
+    #         delta = rewards[t] + self.gamma * values_ext[t + 1] * (1.0 - dones[t]) - values_ext[t]
+    #         gae = delta + self.gamma * self.gae_lambda * (1.0 - dones[t]) * gae
+    #         advantages[t] = gae
+    #
+    #     returns = advantages + values
+    #     return advantages, returns
+
     # --------------------------------------------------
     # PPO update
     # --------------------------------------------------
-    def update(self):
+    def update(self, last_value: float = 0.0):
         states = torch.tensor(np.array(self.buffer.states), dtype=torch.float32, device=self.device)
         actions = torch.tensor(self.buffer.actions, dtype=torch.long, device=self.device)
         old_logprobs = torch.tensor(self.buffer.logprobs, dtype=torch.float32, device=self.device)
@@ -162,14 +185,17 @@ class PPO:
         next_values = np.array(self.buffer.next_values, dtype=np.float32)
         masks = torch.tensor(np.array(self.buffer.masks), dtype=torch.float32, device=self.device)
 
-        advantages, returns = self.compute_gae(rewards, dones, values, next_values)
+        bootstrap_value = 0.0 if len(dones) == 0 or dones[-1] == 1.0 else float(self.buffer.final_value)
+        advantages, returns = self.compute_gae(rewards, dones, values, next_values, bootstrap_value)
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        old_values = torch.tensor(values, dtype=torch.float32, device=self.device)
 
         dataset_size = states.size(0)
         indices = np.arange(dataset_size)
         approx_kl = 0.0
         updates_run = 0
+
+        dataset_size = states.size(0)
+        indices = np.arange(dataset_size)
 
         for _ in range(self.epochs):
             np.random.shuffle(indices)
@@ -183,7 +209,6 @@ class PPO:
                 mb_advantages = advantages[mb_idx]
                 mb_returns = returns[mb_idx]
                 mb_masks = masks[mb_idx]
-                mb_old_values = old_values[mb_idx]
 
                 # Actor
                 logits = self.actor(mb_states)
@@ -192,6 +217,7 @@ class PPO:
                 dist = Categorical(logits=masked_logits)
 
                 new_logprobs = dist.log_prob(mb_actions)
+
                 ratio = torch.exp(new_logprobs - mb_old_logprobs)
 
                 unclipped = ratio * mb_advantages
@@ -200,16 +226,8 @@ class PPO:
 
                 # Critic
                 values_pred = self.critic(mb_states).squeeze(-1)
-                # critic_loss = torch.mean((mb_returns - values_pred) ** 2)
-                value_pred_clipped = mb_old_values + torch.clamp(
-                    values_pred - mb_old_values, -self.value_clip, self.value_clip
-                )
-                critic_loss = torch.mean(
-                    torch.max(
-                        (mb_returns - values_pred) ** 2,
-                        (mb_returns - value_pred_clipped) ** 2,
-                    )
-                )
+                critic_loss = torch.mean((mb_returns - values_pred) ** 2)
+
 
                 # Entropy bonus
                 entropy = dist.entropy().mean()
