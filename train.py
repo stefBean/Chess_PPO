@@ -6,6 +6,8 @@ import subprocess
 import webbrowser
 import time
 import random
+import json
+import os
 
 from board_environment import Chess
 from board_encoding import BoardEncoding
@@ -104,6 +106,7 @@ def quick_eval_gate(
 
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    max_game_ply = 240
 
     # base_env = Chess()
     # base_env = Chess(start_mode="endgame", endgame_max_extra_per_side=3)
@@ -161,6 +164,7 @@ def main():
     entropy_decay = 0.97
     smoothed_return = None
 
+
     #run_name = f"{opponent.__class__.__name__}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
     agent.load("models/ppo_chess", strict=False)
 
@@ -185,7 +189,9 @@ def main():
     opponent_name = "SelfPlay" #if use_self_play else opponent.__class__.__name__
     run_name = f"{opponent_name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
     log_dir = f"runs/{run_name}"
+    os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=log_dir)
+    game_log_path = os.path.join(log_dir, "games.jsonl")
     hparams = {
         "learning_rate_actor": 3e-4,
         "learning_rate_critic": 1e-3,
@@ -215,11 +221,20 @@ def main():
     except Exception as e:
         print(f"[WARN] Could not launch TensorBoard automatically: {e}")
 
+    curriculum_stage = 0
+    gate_hits = 0
+    max_stage = 3
+    threshold = 0.60
+
     while timestep < max_timesteps:
-        obs, info = env.reset()
+        agent_color = chess.WHITE if episode % 2 == 0 else chess.BLACK
+        obs, info = env.reset(options={"max_ply": max_game_ply, "agent_color": agent_color, "curriculum_stage": curriculum_stage})
         board = base_env._board
         done = False
         agent_color = board.turn  # chess.WHITE or chess.BLACK; fixed for this episode
+        starting_fen = board.fen()
+        game_moves = []
+        final_info = None
 
         if use_self_play:
             snap = opponent_pool.sample()
@@ -239,6 +254,7 @@ def main():
 
         while not done:
             state_np = flatten_obs(obs)
+            board_before = board.copy(stack=False)
 
             # ----------------------------------------
             # BUILD LEGAL MOVES + INDEX MAP
@@ -299,6 +315,17 @@ def main():
             # ----------------------------------------
             # STEP ENVIRONMENT
             # ----------------------------------------
+            ply_count = base_env.move_count + 1
+            san_move = board_before.san(move)
+            game_moves.append(
+                {
+                    "ply": ply_count,
+                    "player": "white" if board_before.turn == chess.WHITE else "black",
+                    "uci": move.uci(),
+                    "san": san_move,
+                    "by": "agent",
+                }
+            )
             obs_next, reward_agent, terminated, truncated, info = env.step(move)
             done = terminated or truncated
 
@@ -320,12 +347,24 @@ def main():
                     done = True
                     combined_reward = reward_agent + 1.0
                 else:
+                    opp_board_before = board.copy(stack=False)
+                    opp_ply = base_env.move_count + 1
+                    opp_san = opp_board_before.san(opp_move)
                     obs_after_opp, reward_opp, terminated_opp, truncated_opp, info = env.step(opp_move)
                     combined_reward += reward_opp
                     ep_reward += reward_opp
                     ep_len += 1
                     done = terminated_opp or truncated_opp
                     obs_next = obs_after_opp
+                    game_moves.append(
+                        {
+                            "ply": opp_ply,
+                            "player": "white" if opp_board_before.turn == chess.WHITE else "black",
+                            "uci": opp_move.uci(),
+                            "san": opp_san,
+                            "by": active_fixed_opponent[0] if active_fixed_opponent else "self_play_snapshot",
+                        }
+                    )
 
             # Bootstrap value for the next state to stabilize advantage estimates.
             next_value = 0.0
@@ -363,6 +402,15 @@ def main():
                             f"[POOL] Added snapshot (gate score={gate_score:.3f}); pool size={len(opponent_pool.snapshots)}")
                     else:
                         print(f"[POOL] Skipped snapshot (gate score={gate_score:.3f})")
+                    if gate_score >= threshold:
+                        gate_hits += 1
+                    else:
+                        gate_hits = 0
+
+                    if gate_hits >= 2 and curriculum_stage < max_stage:
+                        curriculum_stage += 1
+                        gate_hits = 0
+                        print(f"[CURRICULUM] Promoted to stage {curriculum_stage}")
                 entropy_coef = max(entropy_coef_min, entropy_coef * entropy_decay)
                 agent.entropy_coef = entropy_coef
                 # last_value = 0.0
@@ -386,8 +434,26 @@ def main():
                 done = True
                 break
 
+        final_info = info
         episode += 1
-        agent_color = np.random.choice([chess.WHITE, chess.BLACK])
+        # agent_color = np.random.choice([chess.WHITE, chess.BLACK])
+        try:
+            with open(game_log_path, "a", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "episode": episode,
+                        "agent_color": "white" if agent_color == chess.WHITE else "black",
+                        "result": (final_info or {}).get("result", board.result()),
+                        "terminal_reason": (final_info or {}).get("terminal_reason"),
+                        "forced_draw": (final_info or {}).get("forced_draw", False),
+                        "start_fen": starting_fen,
+                        "moves": game_moves,
+                    },
+                    f,
+                )
+                f.write("\n")
+        except Exception as e:
+            print(f"[WARN] Failed to log game for episode {episode}: {e}")
 
         print(f"Episode {episode} | Return={ep_reward:.2f} | Length={ep_len}")
         if smoothed_return is None:

@@ -12,6 +12,7 @@ from reward_shaping import RewardShaper
 import random
 import chess
 import gymnasium as gym
+import itertools
 
 
 class Chess(gym.Env):
@@ -99,6 +100,10 @@ class Chess(gym.Env):
         self.require_material_edge = require_material_edge
         self.max_ply = 200
         self.no_progress = 0
+        self._full_endgame_scenarios = self._enumerate_endgame_scenarios()
+        self.curriculum_stage = 0
+        self._curriculum_sorted = None
+        self._curriculum_stage_fracs = [0.15, 0.40, 0.70, 1.0]
 
         #: Indicates whether the env has been reset since it has been created
         #: or the previous game has ended.
@@ -114,7 +119,11 @@ class Chess(gym.Env):
         self.move_count = 0
         options = options or {}
         self.max_ply = int(options.get("max_ply", self.max_ply))
+        desired_color = options.get("agent_color")
         self.no_progress = 0
+        stage = options.get("curriculum_stage")
+        if stage is not None:
+            self.curriculum_stage = int(stage)
 
         if self.start_mode == "endgame":
             self._board = self._generate_endgame_board()
@@ -122,6 +131,9 @@ class Chess(gym.Env):
             self._board = self._generate_curriculum_endgame_board()
         else:
             self._board = chess.Board()
+
+        if desired_color in (chess.WHITE, chess.BLACK):
+            self._board.turn = desired_color
 
         self._ready = True
         info = {}
@@ -151,21 +163,39 @@ class Chess(gym.Env):
             self.no_progress += 1
 
         truncated = False
+        forced_draw = False
+        if self.move_count >= self.max_ply:
+            terminated = True
+            forced_draw = True
+            truncated = True
+        else:
+            terminated = board_after.is_game_over()
+
         if self.move_count >= self.max_ply:
             truncated = True
 
-        reward_terminal = self._reward()
-        terminated = board_after.is_game_over()
+        # reward_terminal = self._reward()
+        # terminated = board_after.is_game_over()
         # truncated = False
         reward_terminal = 0.0
         if terminated:
-            res = board_after.result()
-            if res == "1-0":
-                reward_terminal = +1.0 if mover == chess.WHITE else -1.0
-            elif res == "0-1":
-                reward_terminal = +1.0 if mover == chess.BLACK else -1.0
-            else:
+            #res = board_after.result()
+            #if res == "1-0":
+            #    reward_terminal = +1.0 if mover == chess.WHITE else -1.0
+            #elif res == "0-1":
+            #    reward_terminal = +1.0 if mover == chess.BLACK else -1.0
+            #else:
+            #    reward_terminal = 0.0
+            if forced_draw:
                 reward_terminal = 0.0
+            else:
+                res = board_after.result()
+                if res == "1-0":
+                    reward_terminal = +1.0 if mover == chess.WHITE else -1.0
+                elif res == "0-1":
+                    reward_terminal = +1.0 if mover == chess.BLACK else -1.0
+                else:
+                    reward_terminal = 0.0
 
         if not terminated:
             reward_shaping = self.shaper.shaped_reward(
@@ -180,13 +210,15 @@ class Chess(gym.Env):
         reward = reward_terminal + reward_shaping
 
         observation = self._observation()
+        result_string = "1/2-1/2" if forced_draw else self._board.result()
         info = {
-            "fen": self._board.fen(),
-            "result": self._board.result(),
-            "legal_moves": list(map(str, self._board.legal_moves))
+            "result": result_string,
+            "legal_moves": list(map(str, self._board.legal_moves)),
+            "terminal_reason": "max_ply" if forced_draw else "rule_termination" if terminated else None,
+            "forced_draw": forced_draw,
         }
 
-        if terminated:
+        if terminated or truncated:
             self._ready = False
 
         return observation, reward, terminated, truncated, info
@@ -323,19 +355,35 @@ class Chess(gym.Env):
     def _generate_curriculum_endgame_board(self) -> chess.Board:
         """Create focused endgame tasks (e.g., K+P vs K, K+B+P vs K)."""
 
-        scenarios = self.endgame_scenarios or [
-            {"white": [chess.KING, chess.PAWN], "black": [chess.KING]},
-            {"white": [chess.KING, chess.BISHOP, chess.PAWN], "black": [chess.KING]},
-            {"white": [chess.KING, chess.KNIGHT, chess.PAWN], "black": [chess.KING]},
-            {"white": [chess.KING, chess.ROOK, chess.PAWN], "black": [chess.KING]},
-            {"white": [chess.KING, chess.QUEEN], "black": [chess.KING, chess.PAWN]},
-            {"white": [chess.KING, chess.ROOK], "black": [chess.KING, chess.PAWN]},
-            {"white": [chess.KING, chess.QUEEN], "black": [chess.KING, chess.ROOK]},
-        ]
+        # scenarios = self.endgame_scenarios or [
+        #     {"white": [chess.KING, chess.PAWN], "black": [chess.KING]},
+        #     {"white": [chess.KING, chess.BISHOP, chess.PAWN], "black": [chess.KING]},
+        #     {"white": [chess.KING, chess.KNIGHT, chess.PAWN], "black": [chess.KING]},
+        #     {"white": [chess.KING, chess.ROOK, chess.PAWN], "black": [chess.KING]},
+        #     {"white": [chess.KING, chess.QUEEN], "black": [chess.KING, chess.PAWN]},
+        #     {"white": [chess.KING, chess.ROOK], "black": [chess.KING, chess.PAWN]},
+        #     {"white": [chess.KING, chess.QUEEN], "black": [chess.KING, chess.ROOK]},
+        # ]
+        """Create focused endgame tasks (e.g., K+P vs K, K+B+P vs K).
+
+                This version enumerates all material configurations up to the configured
+                `endgame_max_extra_per_side` so the agent cycles through every classical
+                endgame permutation instead of a small handcrafted list.
+                """
+
+        scenarios = self.endgame_scenarios or self._full_endgame_scenarios
+        if self._curriculum_sorted is None:
+            scenarios = self.endgame_scenarios or self._enumerate_endgame_scenarios()
+            self._curriculum_sorted = sorted(scenarios, key=self._scenario_difficulty)
+
+        stage = max(0, min(self.curriculum_stage, len(self._curriculum_stage_fracs) - 1))
+        frac = self._curriculum_stage_fracs[stage]
+        k = max(1, int(len(self._curriculum_sorted) * frac))
+        candidate_scenarios = self._curriculum_sorted[:k]
 
         # Also allow mirroring colors for diversity
-        for _ in range(200):
-            scenario = random.choice(scenarios)
+        for _ in range(400):
+            scenario = random.choice(candidate_scenarios)
             if random.random() < 0.5:
                 scenario = {"white": scenario["black"], "black": scenario["white"]}
 
@@ -361,13 +409,12 @@ class Chess(gym.Env):
             if not self._place_piece_set(board, occupied, scenario["black"], chess.BLACK):
                 continue
 
-            board.turn = random.choice([chess.WHITE, chess.BLACK])
-
             if not board.is_valid():
                 continue
             if board.is_checkmate() or board.is_stalemate() or board.is_insufficient_material():
                 continue
             if any(True for _ in board.legal_moves):
+                board.turn = random.choice([chess.WHITE, chess.BLACK])
                 return board
 
         raise RuntimeError("Failed to generate a curriculum endgame board")
@@ -384,6 +431,56 @@ class Chess(gym.Env):
             board.set_piece_at(square, chess.Piece(piece_type, color))
             occupied.add(square)
         return True
+
+    def _enumerate_endgame_scenarios(self) -> List[Dict[str, List[chess.PieceType]]]:
+        """Enumerate all compact endgame material configurations.
+
+        Scenarios cover every combination of up to `endgame_max_extra_per_side`
+        extra pieces for each color drawn from the canonical endgame set
+        (queen, rook, bishop, knight, pawn). Kings are always included.
+        """
+
+        piece_pool = [
+            chess.PAWN,
+            chess.KNIGHT,
+            chess.BISHOP,
+            chess.ROOK,
+            chess.QUEEN,
+        ]
+        scenarios: List[Dict[str, List[chess.PieceType]]] = []
+
+        def expand_combo(count: int):
+            for combo in itertools.combinations_with_replacement(piece_pool, count):
+                yield list(combo)
+
+        for white_count in range(0, self.endgame_max_extra_per_side + 1):
+            for black_count in range(0, self.endgame_max_extra_per_side + 1):
+                if white_count + black_count < self.endgame_min_extra_total:
+                    continue
+                for white_combo in expand_combo(white_count):
+                    for black_combo in expand_combo(black_count):
+                        if self.require_pawn and chess.PAWN not in (white_combo + black_combo):
+                            continue
+                        scenarios.append(
+                            {
+                                "white": [chess.KING] + white_combo,
+                                "black": [chess.KING] + black_combo,
+                            }
+                        )
+
+        # simple fallback scenario in case strict filters remove all
+        if not scenarios:
+            scenarios.append({"white": [chess.KING, chess.PAWN], "black": [chess.KING]})
+
+        return scenarios
+
+    def _scenario_difficulty(self, scenario) -> float:
+        values = {
+            chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3, chess.ROOK: 5, chess.QUEEN: 9
+        }
+        w = sum(values.get(p, 0) for p in scenario["white"] if p != chess.KING)
+        b = sum(values.get(p, 0) for p in scenario["black"] if p != chess.KING)
+        return (w + b) + 0.3 * abs(w - b)
 
     def _sample_square(
             self,

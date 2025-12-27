@@ -136,17 +136,17 @@ class RewardShaper:
         #     if move.from_square in starting_squares[piece.color]:
         #         reward += self.piece_development_reward
 
-            # --- Endgame pawn and king incentives ---
-            reward += self._pawn_progress(board_before, board_after, move)
-            reward += self._king_activity(board_before, board_after, move)
-            reward += self._mate_pressure(board_after)
+        # --- Endgame pawn and king incentives ---
+        reward += self._pawn_progress(board_before, board_after, move)
+        reward += self._king_activity(board_before, board_after, move)
+        reward += self._mate_pressure(board_after)
 
         # --- Repetitive movement penalty ---
         if board_after.can_claim_threefold_repetition():
             reward += self.repeat_penalty
 
         # --- Stall penalty (too many moves) ---
-        if move_count > 300:
+        if move_count > 160:
             reward += self.stalling_penalty
 
         return reward
