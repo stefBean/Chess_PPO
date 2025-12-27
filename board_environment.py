@@ -123,7 +123,10 @@ class Chess(gym.Env):
         self.no_progress = 0
         stage = options.get("curriculum_stage")
         if stage is not None:
-            self.curriculum_stage = int(stage)
+            try:
+                self.curriculum_stage = int(stage)
+            except (TypeError, ValueError):
+                pass
 
         if self.start_mode == "endgame":
             self._board = self._generate_endgame_board()
@@ -373,7 +376,7 @@ class Chess(gym.Env):
 
         scenarios = self.endgame_scenarios or self._full_endgame_scenarios
         if self._curriculum_sorted is None:
-            scenarios = self.endgame_scenarios or self._enumerate_endgame_scenarios()
+            # scenarios = self.endgame_scenarios or self._enumerate_endgame_scenarios()
             self._curriculum_sorted = sorted(scenarios, key=self._scenario_difficulty)
 
         stage = max(0, min(self.curriculum_stage, len(self._curriculum_stage_fracs) - 1))

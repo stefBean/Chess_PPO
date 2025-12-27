@@ -184,6 +184,7 @@ class PPO:
         values = np.array(self.buffer.values, dtype=np.float32)
         next_values = np.array(self.buffer.next_values, dtype=np.float32)
         masks = torch.tensor(np.array(self.buffer.masks), dtype=torch.float32, device=self.device)
+        values_tensor = torch.tensor(values, dtype=torch.float32, device=self.device)
 
         bootstrap_value = 0.0 if len(dones) == 0 or dones[-1] == 1.0 else float(self.buffer.final_value)
         advantages, returns = self.compute_gae(rewards, dones, values, next_values, bootstrap_value)
@@ -209,6 +210,7 @@ class PPO:
                 mb_advantages = advantages[mb_idx]
                 mb_returns = returns[mb_idx]
                 mb_masks = masks[mb_idx]
+                mb_values_old = values_tensor[mb_idx]
 
                 # Actor
                 logits = self.actor(mb_states)
@@ -226,8 +228,16 @@ class PPO:
 
                 # Critic
                 values_pred = self.critic(mb_states).squeeze(-1)
-                critic_loss = torch.mean((mb_returns - values_pred) ** 2)
-
+                # critic_loss = torch.mean((mb_returns - values_pred) ** 2)
+                if self.value_clip is not None:
+                    values_pred_clipped = mb_values_old + torch.clamp(
+                        values_pred - mb_values_old, -self.value_clip, self.value_clip
+                    )
+                    critic_loss_unclipped = (mb_returns - values_pred) ** 2
+                    critic_loss_clipped = (mb_returns - values_pred_clipped) ** 2
+                    critic_loss = torch.mean(torch.max(critic_loss_unclipped, critic_loss_clipped))
+                else:
+                    critic_loss = torch.mean((mb_returns - values_pred) ** 2)
 
                 # Entropy bonus
                 entropy = dist.entropy().mean()

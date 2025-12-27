@@ -42,6 +42,7 @@ def quick_eval_gate(
     games: int = 2,
     max_plies: int = 40,
     history_length: int = 2,
+    curriculum_stage: int = 0,
 ):
     """Lightweight evaluation to decide if a snapshot enters the pool."""
     base_env = Chess(start_mode="curriculum_endgame", endgame_max_extra_per_side=3)
@@ -51,7 +52,7 @@ def quick_eval_gate(
     actor.eval()
 
     for _ in range(games):
-        obs, _ = env_eval.reset()
+        obs, _ = env_eval.reset(options={"curriculum_stage": curriculum_stage})
         board = base_env._board
         done = False
         plies = 0
@@ -107,6 +108,10 @@ def quick_eval_gate(
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     max_game_ply = 240
+    curriculum_stage = 0
+    gate_hits = 0
+    max_stage = 3
+    threshold = 0.60
 
     # base_env = Chess()
     # base_env = Chess(start_mode="endgame", endgame_max_extra_per_side=3)
@@ -123,7 +128,7 @@ def main():
     encoder = AlphaZeroActionEncoder()
 
     # Get initial observation to determine dimensions
-    obs, info = env.reset()
+    obs, info = env.reset(options={"curriculum_stage": curriculum_stage})
     state_dim = flatten_obs(obs).shape[0]
     action_dim = encoder.ACT_DIM
 
@@ -220,11 +225,6 @@ def main():
 
     except Exception as e:
         print(f"[WARN] Could not launch TensorBoard automatically: {e}")
-
-    curriculum_stage = 0
-    gate_hits = 0
-    max_stage = 3
-    threshold = 0.60
 
     while timestep < max_timesteps:
         agent_color = chess.WHITE if episode % 2 == 0 else chess.BLACK
@@ -395,7 +395,7 @@ def main():
                 update_count += 1
 
                 if update_count % snapshot_every == 0:
-                    gate_score = quick_eval_gate(agent.actor, encoder, flatten_obs, agent.device)
+                    gate_score = quick_eval_gate(agent.actor, encoder, flatten_obs, agent.device, curriculum_stage=curriculum_stage)
                     if gate_score >= -0.05:
                         opponent_pool.add(agent.actor)
                         print(
