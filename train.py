@@ -297,13 +297,19 @@ def main():
             legal_mask_np[idxs] = 1.0
 
             action_id, logprob, value = agent.select_action(state_np, legal_mask_np)
-            move = idx_to_move.get(action_id, np.random.choice(list(board.legal_moves)))
-            # Map selected action to legal move
-            if action_id not in idx_to_move:
-                # Very rare fallback: sample a legal move directly
-                move = np.random.choice(legal_moves)
-            else:
-                move = idx_to_move[action_id]
+            move = idx_to_move.get(action_id)
+            if move is None:
+                raise RuntimeError(
+                    f"Action id {action_id} not in idx_to_move (mask/encoding mismatch). "
+                    f"Legal idx count={len(idxs)} fen={board.fen()}"
+                )
+            # move = idx_to_move.get(action_id, np.random.choice(list(board.legal_moves)))
+            # # Map selected action to legal move
+            # if action_id not in move:
+            #     # Very rare fallback: sample a legal move directly
+            #     move = np.random.choice(legal_moves)
+            # else:
+            #     move = idx_to_move[action_id]
 
             # Final safety check
             if move not in board.legal_moves:
@@ -396,7 +402,7 @@ def main():
 
                 if update_count % snapshot_every == 0:
                     gate_score = quick_eval_gate(agent.actor, encoder, flatten_obs, agent.device, curriculum_stage=curriculum_stage)
-                    if gate_score >= -0.05:
+                    if gate_score >= -0.15:
                         opponent_pool.add(agent.actor)
                         print(
                             f"[POOL] Added snapshot (gate score={gate_score:.3f}); pool size={len(opponent_pool.snapshots)}")
@@ -426,6 +432,10 @@ def main():
                 writer.add_scalar("Loss/entropy", metrics["entropy"], timestep)
                 writer.add_scalar("Loss/entropy_coef", entropy_coef, timestep)
                 writer.add_scalar("KL/approx_kl", metrics["approx_kl"], timestep)
+                writer.add_scalar("KL/policy_shift", metrics["policy_shift_kl"], timestep)
+                writer.add_scalar("Policy/expected_advantage", metrics["expected_advantage"], timestep)
+                writer.add_scalar("Policy/action_value_gap", metrics["action_value_gap"], timestep)
+                writer.add_scalar("Policy/policy_entropy", metrics["entropy"], timestep)
                 writer.add_scalar("Optimization/minibatches", metrics["updates_run"], timestep)
                 writer.add_scalar("Timesteps/timestep", timestep, timestep)
                 writer.flush()

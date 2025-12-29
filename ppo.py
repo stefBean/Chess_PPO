@@ -175,7 +175,7 @@ class PPO:
     # --------------------------------------------------
     # PPO update
     # --------------------------------------------------
-    def update(self, last_value: float = 0.0):
+    def update(self):
         states = torch.tensor(np.array(self.buffer.states), dtype=torch.float32, device=self.device)
         actions = torch.tensor(self.buffer.actions, dtype=torch.long, device=self.device)
         old_logprobs = torch.tensor(self.buffer.logprobs, dtype=torch.float32, device=self.device)
@@ -186,17 +186,27 @@ class PPO:
         masks = torch.tensor(np.array(self.buffer.masks), dtype=torch.float32, device=self.device)
         values_tensor = torch.tensor(values, dtype=torch.float32, device=self.device)
 
-        bootstrap_value = 0.0 if len(dones) == 0 or dones[-1] == 1.0 else float(self.buffer.final_value)
-        advantages, returns = self.compute_gae(rewards, dones, values, next_values, bootstrap_value)
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        bootstrap_value = 0.0 if len(dones) == 0 or dones[-1] == 1.0 else float(next_values[-1])
+        advantages_raw, returns = self.compute_gae(rewards, dones, values, next_values, bootstrap_value)
+        advantages = (advantages_raw - advantages_raw.mean()) / (advantages_raw.std() + 1e-8)
 
         dataset_size = states.size(0)
         indices = np.arange(dataset_size)
         approx_kl = 0.0
         updates_run = 0
 
-        dataset_size = states.size(0)
-        indices = np.arange(dataset_size)
+        # Snapshot of the old policy to quantify policy shift (KL divergence)
+        with torch.no_grad():
+            old_logits = self.actor(states)
+            old_masked_logits = old_logits.masked_fill(masks == 0, -1e9)
+
+        entropy_terms = []
+        expected_adv_terms = []
+        action_value_gaps = []
+        policy_shift_kls = []
+        actor_losses = []
+        critic_losses = []
+        approx_kls = []
 
         for _ in range(self.epochs):
             np.random.shuffle(indices)
@@ -240,12 +250,13 @@ class PPO:
                     critic_loss = torch.mean((mb_returns - values_pred) ** 2)
 
                 # Entropy bonus
-                entropy = dist.entropy().mean()
+                entropy = dist.entropy()
+                entropy_mean = entropy.mean()
                 # loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy
                 loss = (
                         actor_loss
                         + self.value_coef * critic_loss
-                        - self.entropy_coef * entropy
+                        - self.entropy_coef * entropy_mean
                 )
 
                 self.optim_actor.zero_grad()
@@ -259,6 +270,31 @@ class PPO:
                 self.optim_critic.step()
 
                 approx_kl = torch.mean(mb_old_logprobs - new_logprobs).item()
+
+                # Track decision-quality diagnostics
+                entropy_terms.append(entropy_mean.detach())
+                # Expected advantage under the new policy (before clipping)
+                mb_advantages_raw = advantages_raw[mb_idx]
+                expected_adv_terms.append(torch.mean(ratio * mb_advantages_raw).detach())
+
+                actor_losses.append(actor_loss.detach())
+                critic_losses.append(critic_loss.detach())
+                approx_kls.append(torch.tensor(approx_kl, device=self.device))
+
+                # Action-value gap: difference between the most and second-most probable legal actions
+                probs = dist.probs
+                top_k = min(2, probs.shape[-1])
+                top_vals, _ = torch.topk(probs, k=top_k, dim=1)
+                if top_k == 1:
+                    gap_batch = top_vals[:, 0]
+                else:
+                    gap_batch = top_vals[:, 0] - top_vals[:, 1]
+                action_value_gaps.append(gap_batch.mean().detach())
+
+                # KL divergence to previous policy snapshot (policy shift)
+                old_dist = Categorical(logits=old_masked_logits[mb_idx])
+                policy_shift_kls.append(torch.distributions.kl_divergence(dist, old_dist).mean().detach())
+
                 updates_run += 1
                 if self.target_kl and approx_kl > 1.5 * self.target_kl:
                     break
@@ -267,12 +303,19 @@ class PPO:
 
         self.buffer.clear()
         return {
-            "actor_loss": actor_loss.item(),
-            "critic_loss": critic_loss.item(),
-            "entropy": entropy.item(),
+            # "actor_loss": actor_loss.item(),
+            # "critic_loss": critic_loss.item(),
+            "entropy": float(torch.stack(entropy_terms).mean().item()) if entropy_terms else 0.0,
             "entropy_coef": float(self.entropy_coef),
-            "approx_kl": approx_kl,
+            # "approx_kl": approx_kl,
             "updates_run": updates_run,
+            "expected_advantage": float(torch.stack(expected_adv_terms).mean().item()) if expected_adv_terms else 0.0,
+            "action_value_gap": float(torch.stack(action_value_gaps).mean().item()) if action_value_gaps else 0.0,
+            "policy_shift_kl": float(torch.stack(policy_shift_kls).mean().item()) if policy_shift_kls else 0.0,
+            "actor_loss": float(torch.stack(actor_losses).mean().item()) if actor_losses else 0.0,
+            "critic_loss": float(torch.stack(critic_losses).mean().item()) if critic_losses else 0.0,
+            "approx_kl": float(torch.stack(approx_kls).mean().item()) if approx_kls else 0.0,
+
         }
 
     # ==========================================================
