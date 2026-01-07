@@ -43,6 +43,7 @@ def quick_eval_gate(
     max_plies: int = 40,
     history_length: int = 2,
     curriculum_stage: int = 0,
+    temperature: float = 1.0,
 ):
     """Lightweight evaluation to decide if a snapshot enters the pool."""
     base_env = Chess(start_mode="curriculum_endgame", endgame_max_extra_per_side=3)
@@ -71,7 +72,7 @@ def quick_eval_gate(
             legal_mask = torch.from_numpy(legal_mask_np).to(device).unsqueeze(0)
 
             with torch.no_grad():
-                logits = actor(state)
+                logits = actor(state) / max(temperature, 1e-6)
                 masked_logits = logits.masked_fill(legal_mask == 0, -1e9)
                 dist = torch.distributions.Categorical(logits=masked_logits)
                 action = dist.sample()
@@ -134,6 +135,9 @@ def main():
 
     print(f"State dim: {state_dim}, Action dim: {action_dim}, Device: {device}")
 
+    entropy_target_start = 0.65
+    entropy_target_end = 0.25
+
     agent = PPO(
         state_dim=state_dim,
         action_dim=action_dim,
@@ -141,17 +145,25 @@ def main():
         critic_lr=1e-3,
         gamma=0.99,
         gae_lambda=0.95,
-        clip_eps=0.2,
-        epochs=5,
-        minibatch_size=384,
+        clip_eps=0.13,
+        epochs=10,
+        minibatch_size=64,
         device=device,
-        entropy_coef=0.03,
-        value_coef=0.65,
+        entropy_coef=0.02,
+        value_coef=0.5,
         max_grad_norm=0.6,
         value_clip=0.25,
         target_kl=0.015,
         reward_scale=0.85,
         reward_clip=2.5,
+        entropy_target=entropy_target_start,
+        entropy_coef_lr=0.005,
+        entropy_coef_min=0.002,
+        entropy_coef_max=0.08,
+        temperature=1.0,
+        temperature_lr=0.01,
+        temperature_min=0.7,
+        temperature_max=1.0,
     )
 
     #agent.load("models/ppo_chess")
@@ -164,9 +176,9 @@ def main():
     steps_per_update = 6144 #4096 #256 #
     timestep = 0
     episode = 0
-    entropy_coef = agent.entropy_coef
-    entropy_coef_min = 0.005
-    entropy_decay = 0.97
+    # entropy_coef = agent.entropy_coef
+    # entropy_coef_min = 0.005
+    # entropy_decay = 0.97
     smoothed_return = None
 
 
@@ -185,7 +197,7 @@ def main():
         refresh_interval=steps_per_update,
         pool_size=6,
         sample_past_prob=0.4,
-        temperature=1.05,
+        temperature=agent.temperature,
     )
 
     opponent_pool.add(agent.actor)
@@ -204,12 +216,18 @@ def main():
         "epochs_per_update": 5,
         "opponent": opponent_name,
         "steps_per_update": steps_per_update,
-        "entropy_coef_init": 0.03,
-        "entropy_coef_min": entropy_coef_min,
+        "entropy_coef_init": agent.entropy_coef,
+        "entropy_coef_min": agent.entropy_coef_min,
+        "entropy_coef_max": agent.entropy_coef_max,
+        "entropy_target_start": entropy_target_start,
+        "entropy_target_end": entropy_target_end,
         "value_coef": 0.65,
         "selfplay_snapshot_pool": 6,
         "target_kl": 0.015,
         "reward_scale": 0.85,
+        "temperature_init": agent.temperature,
+        "temperature_min": agent.temperature_min,
+        "temperature_max": agent.temperature_max,
     }
     try:
         # Start TensorBoard as background process
@@ -397,11 +415,24 @@ def main():
 
             if timestep % steps_per_update == 0:
                 print(f"\nPPO UPDATE @ timestep {timestep}, episode {episode}")
+                progress = min(1.0, timestep / max_timesteps)
+                agent.entropy_target = entropy_target_start + (entropy_target_end - entropy_target_start) * progress
+
                 metrics = agent.update()
+                self_play_opponent.temperature = agent.temperature
+
                 update_count += 1
 
                 if update_count % snapshot_every == 0:
-                    gate_score = quick_eval_gate(agent.actor, encoder, flatten_obs, agent.device, curriculum_stage=curriculum_stage)
+                    # gate_score = quick_eval_gate(agent.actor, encoder, flatten_obs, agent.device, curriculum_stage=curriculum_stage)
+                    gate_score = quick_eval_gate(
+                        agent.actor,
+                        encoder,
+                        flatten_obs,
+                        agent.device,
+                        curriculum_stage=curriculum_stage,
+                        temperature=agent.temperature,
+                    )
                     if gate_score >= -0.15:
                         opponent_pool.add(agent.actor)
                         print(
@@ -417,8 +448,18 @@ def main():
                         curriculum_stage += 1
                         gate_hits = 0
                         print(f"[CURRICULUM] Promoted to stage {curriculum_stage}")
-                entropy_coef = max(entropy_coef_min, entropy_coef * entropy_decay)
-                agent.entropy_coef = entropy_coef
+                # entropy_coef = max(entropy_coef_min, entropy_coef * entropy_decay)
+                # agent.entropy_coef = entropy_coef
+
+                # Adaptive entropy controller (normalized entropy target)
+                entropy_target_start = 0.60  # high exploration early
+                entropy_target_end = 0.20  # more deterministic later
+                entropy_target_decay = 0.985  # per update
+                entropy_target = entropy_target_start
+
+                alpha_lr = 0.002  # controller step size (small!)
+                alpha_min = 0.003
+                alpha_max = 0.05
                 # last_value = 0.0
                 # if not done:
                 #     state_np = flatten_obs(obs).astype(np.float32)
@@ -430,12 +471,16 @@ def main():
                 writer.add_scalar("Loss/actor", metrics["actor_loss"], timestep)
                 writer.add_scalar("Loss/critic", metrics["critic_loss"], timestep)
                 writer.add_scalar("Loss/entropy", metrics["entropy"], timestep)
-                writer.add_scalar("Loss/entropy_coef", entropy_coef, timestep)
+                writer.add_scalar("Loss/entropy_normalized", metrics["normalized_entropy"], timestep)
+                writer.add_scalar("Loss/entropy_coef", metrics["entropy_coef"], timestep)
                 writer.add_scalar("KL/approx_kl", metrics["approx_kl"], timestep)
                 writer.add_scalar("KL/policy_shift", metrics["policy_shift_kl"], timestep)
                 writer.add_scalar("Policy/expected_advantage", metrics["expected_advantage"], timestep)
                 writer.add_scalar("Policy/action_value_gap", metrics["action_value_gap"], timestep)
                 writer.add_scalar("Policy/policy_entropy", metrics["entropy"], timestep)
+                writer.add_scalar("Policy/policy_entropy_normalized", metrics["normalized_entropy"], timestep)
+                writer.add_scalar("Policy/entropy_target", agent.entropy_target, timestep)
+                writer.add_scalar("Policy/temperature", metrics["temperature"], timestep)
                 writer.add_scalar("Optimization/minibatches", metrics["updates_run"], timestep)
                 writer.add_scalar("Timesteps/timestep", timestep, timestep)
                 writer.flush()

@@ -47,7 +47,7 @@ class PPO:
         critic_lr: float = 1e-3,
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
-        clip_eps: float = 0.2,
+        clip_eps: float = 0.13,
         epochs: int = 10,
         minibatch_size: int = 64,
         device: str = "cpu",
@@ -58,6 +58,14 @@ class PPO:
         target_kl: float = 0.02,
         reward_scale: float = 1.0,
         reward_clip: float | None = 2.0,
+        entropy_target: float = 0.6,
+        entropy_coef_lr: float = 0.005,
+        entropy_coef_min: float = 0.002,
+        entropy_coef_max: float = 0.08,
+        temperature: float = 1.0,
+        temperature_lr: float = 0.01,
+        temperature_min: float = 0.7,
+        temperature_max: float = 1.0,
     ):
         self.device = torch.device(device)
         self.gamma = gamma
@@ -72,6 +80,14 @@ class PPO:
         self.target_kl = target_kl
         self.reward_scale = reward_scale
         self.reward_clip = reward_clip
+        self.entropy_target = entropy_target
+        self.entropy_coef_lr = entropy_coef_lr
+        self.entropy_coef_min = entropy_coef_min
+        self.entropy_coef_max = entropy_coef_max
+        self.temperature = temperature
+        self.temperature_lr = temperature_lr
+        self.temperature_min = temperature_min
+        self.temperature_max = temperature_max
 
         self.actor = Actor(state_dim, action_dim).to(self.device)
         self.critic = Critic(state_dim).to(self.device)
@@ -91,9 +107,11 @@ class PPO:
         legal_mask = torch.from_numpy(legal_mask_np).to(self.device).unsqueeze(0)
 
         with torch.no_grad():
-            logits = self.actor(state)
-            mask_tensor = (legal_mask == 0)
+            logits = self.actor(state) / max(self.temperature, 1e-6)
+            mask_tensor = legal_mask == 0
             masked_logits = logits.masked_fill(mask_tensor, -1e9)
+            top2 = torch.topk(masked_logits, k=2, dim=-1).values
+            gap = (top2[:, 0] - top2[:, 1]).mean()
             dist = Categorical(logits=masked_logits)
             action = dist.sample()
             logprob = dist.log_prob(action)
@@ -197,10 +215,11 @@ class PPO:
 
         # Snapshot of the old policy to quantify policy shift (KL divergence)
         with torch.no_grad():
-            old_logits = self.actor(states)
+            old_logits = self.actor(states) / max(self.temperature, 1e-6)
             old_masked_logits = old_logits.masked_fill(masks == 0, -1e9)
 
         entropy_terms = []
+        normalized_entropy_terms = []
         expected_adv_terms = []
         action_value_gaps = []
         policy_shift_kls = []
@@ -223,10 +242,11 @@ class PPO:
                 mb_values_old = values_tensor[mb_idx]
 
                 # Actor
-                logits = self.actor(mb_states)
-                mask_tensor = (mb_masks == 0)
+                logits = self.actor(mb_states) / max(self.temperature, 1e-6)
+                mask_tensor = mb_masks == 0
                 masked_logits = logits.masked_fill(mask_tensor, -1e9)
                 dist = Categorical(logits=masked_logits)
+
 
                 new_logprobs = dist.log_prob(mb_actions)
 
@@ -251,12 +271,16 @@ class PPO:
 
                 # Entropy bonus
                 entropy = dist.entropy()
+                legal_count = mb_masks.sum(dim=-1).clamp(min=1.0)
+                normalization = torch.clamp(torch.log(legal_count), min=1e-8)
+                normalized_entropy = entropy / normalization
+                normalized_entropy_mean = normalized_entropy.mean()
                 entropy_mean = entropy.mean()
                 # loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy
                 loss = (
                         actor_loss
                         + self.value_coef * critic_loss
-                        - self.entropy_coef * entropy_mean
+                        - self.entropy_coef * normalized_entropy_mean
                 )
 
                 self.optim_actor.zero_grad()
@@ -273,6 +297,7 @@ class PPO:
 
                 # Track decision-quality diagnostics
                 entropy_terms.append(entropy_mean.detach())
+                normalized_entropy_terms.append(normalized_entropy_mean.detach())
                 # Expected advantage under the new policy (before clipping)
                 mb_advantages_raw = advantages_raw[mb_idx]
                 expected_adv_terms.append(torch.mean(ratio * mb_advantages_raw).detach())
@@ -283,12 +308,16 @@ class PPO:
 
                 # Action-value gap: difference between the most and second-most probable legal actions
                 probs = dist.probs
-                top_k = min(2, probs.shape[-1])
-                top_vals, _ = torch.topk(probs, k=top_k, dim=1)
-                if top_k == 1:
-                    gap_batch = top_vals[:, 0]
-                else:
-                    gap_batch = top_vals[:, 0] - top_vals[:, 1]
+                top2 = torch.topk(masked_logits, k=2, dim=1).values
+                gap_batch = top2[:, 0] - top2[:, 1]
+                action_value_gaps.append(gap_batch.mean().detach())
+
+                # top_k = min(2, probs.shape[-1])
+                # top_vals, _ = torch.topk(probs, k=top_k, dim=1)
+                # if top_k == 1:
+                #     gap_batch = top_vals[:, 0]
+                # else:
+                #     gap_batch = top_vals[:, 0] - top_vals[:, 1]
                 action_value_gaps.append(gap_batch.mean().detach())
 
                 # KL divergence to previous policy snapshot (policy shift)
@@ -301,12 +330,29 @@ class PPO:
             if self.target_kl and approx_kl > 1.5 * self.target_kl:
                 break
 
+        entropy_mean_value = float(torch.stack(entropy_terms).mean().item()) if entropy_terms else 0.0
+        normalized_entropy_value = (
+            float(torch.stack(normalized_entropy_terms).mean().item()) if normalized_entropy_terms else 0.0
+        )
+
+        # Dual controller: adjust entropy coefficient and temperature toward the target normalized entropy.
+        if normalized_entropy_terms and self.entropy_target is not None:
+            entropy_error = self.entropy_target - normalized_entropy_value
+            updated_coef = self.entropy_coef + self.entropy_coef_lr * entropy_error
+            self.entropy_coef = float(np.clip(updated_coef, self.entropy_coef_min, self.entropy_coef_max))
+
+            ## TODO: enable after a while of training, just disabled initially with fix temperature set = 1.05
+            updated_temp = self.temperature + self.temperature_lr * entropy_error
+            self.temperature = float(np.clip(updated_temp, self.temperature_min, self.temperature_max))
+
         self.buffer.clear()
         return {
             # "actor_loss": actor_loss.item(),
             # "critic_loss": critic_loss.item(),
-            "entropy": float(torch.stack(entropy_terms).mean().item()) if entropy_terms else 0.0,
+            "entropy": entropy_mean_value,
+            "normalized_entropy": normalized_entropy_value,
             "entropy_coef": float(self.entropy_coef),
+            "temperature": float(self.temperature),
             # "approx_kl": approx_kl,
             "updates_run": updates_run,
             "expected_advantage": float(torch.stack(expected_adv_terms).mean().item()) if expected_adv_terms else 0.0,
