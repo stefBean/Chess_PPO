@@ -98,7 +98,7 @@ class Chess(gym.Env):
         self.endgame_min_extra_total = endgame_min_extra_total
         self.require_pawn = require_pawn
         self.require_material_edge = require_material_edge
-        self.max_ply = 200
+        self.max_ply: int | None = 200 #200
         self.no_progress = 0
         self._full_endgame_scenarios = self._enumerate_endgame_scenarios()
         self.curriculum_stage = 0
@@ -118,7 +118,12 @@ class Chess(gym.Env):
         # self._board = chess.Board()
         self.move_count = 0
         options = options or {}
-        self.max_ply = int(options.get("max_ply", self.max_ply))
+        # self.max_ply = int(options.get("max_ply", self.max_ply))
+        max_ply_option = options.get("max_ply", self.max_ply)
+        if max_ply_option is None:
+            self.max_ply = None
+        else:
+            self.max_ply = int(max_ply_option)
         desired_color = options.get("agent_color")
         self.no_progress = 0
         stage = options.get("curriculum_stage")
@@ -167,15 +172,17 @@ class Chess(gym.Env):
 
         truncated = False
         forced_draw = False
-        if self.move_count >= self.max_ply:
+        #if self.move_count >= self.max_ply:
+        max_ply_limit = self.max_ply is not None and self.max_ply > 0
+        if max_ply_limit and self.move_count >= self.max_ply:
             terminated = True
             forced_draw = True
             truncated = True
         else:
             terminated = board_after.is_game_over()
 
-        if self.move_count >= self.max_ply:
-            truncated = True
+        # if self.move_count >= self.max_ply:
+        #    truncated = True
 
         # reward_terminal = self._reward()
         # terminated = board_after.is_game_over()
@@ -201,13 +208,16 @@ class Chess(gym.Env):
                     reward_terminal = 0.0
 
         if not terminated:
-            reward_shaping = self.shaper.shaped_reward(
+            # reward_shaping = self.shaper.shaped_reward
+            reward_breakdown = self.shaper.shaped_reward_breakdown(
                 board_before,
                 board_after,
                 action,
-                self.move_count
+                self.move_count,
             )
+            reward_shaping = reward_breakdown["total"]
         else:
+            reward_breakdown = self.shaper._blank_breakdown()
             reward_shaping = 0.0
 
         reward = reward_terminal + reward_shaping
@@ -219,6 +229,10 @@ class Chess(gym.Env):
             "legal_moves": list(map(str, self._board.legal_moves)),
             "terminal_reason": "max_ply" if forced_draw else "rule_termination" if terminated else None,
             "forced_draw": forced_draw,
+            "reward_terminal": reward_terminal,
+            "reward_shaping": reward_shaping,
+            "reward_total": reward,
+            "reward_breakdown": reward_breakdown,
         }
 
         if terminated or truncated:

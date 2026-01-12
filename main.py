@@ -1,5 +1,6 @@
 from board_environment import Chess
 from board_encoding import BoardEncoding
+from inspect_board import BoardAnalyzer
 import chess
 
 def main():
@@ -10,8 +11,13 @@ def main():
     obs, info = env.reset()
     print("Initial observation shape:", obs.shape)
 
+    analyzer = BoardAnalyzer()
+
+
     print("\nInitial board:")
-    print(base_env.render())
+    # print(base_env.render())
+    print(analyzer.describe_board(base_env._board))
+
 
     # Pick a move
     move = chess.Move.from_uci("e2e4")
@@ -19,7 +25,9 @@ def main():
     # Step
     obs, reward, terminated, truncated, info = env.step(move)
     print("\nAfter move e2e4:")
-    print(base_env.render())
+    # print(base_env.render())
+    print(analyzer.describe_board(base_env._board))
+
     print("Reward:", reward, "Terminated:", terminated, "Truncated:", truncated)
     print("Observation shape:", obs.shape)
 

@@ -8,6 +8,8 @@ import time
 import random
 import json
 import os
+import sys
+import threading
 
 from board_environment import Chess
 from board_encoding import BoardEncoding
@@ -18,6 +20,9 @@ from opponent_heuristic import HeuristicOpponent
 from opponent_selfplay import SelfPlayOpponent, build_action_map, OpponentPool
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
+from inspect_board import BoardAnalyzer
+from collections import deque
+
 from copy import deepcopy
 
 def flatten_obs(obs):
@@ -105,10 +110,142 @@ def quick_eval_gate(
     actor.train()
     return total_score / max(1, games)
 
+def print_game_with_analysis(moves, start_fen, episode, analyzer, outcome_summary, endgame_start):
+    print(
+        f"\n[GAME] Episode {episode} | start FEN: {start_fen} | "
+        f"result: {outcome_summary['result']} | winner: {outcome_summary['winner_label']}"
+    )
+    print(
+        f"[GAME] Agent: {outcome_summary['agent_side']} | Opponent: {outcome_summary['opponent_side']} "
+        f"({outcome_summary['opponent_label']})"
+    )
+    if endgame_start["ply"] is not None:
+        print(
+            f"[GAME] Endgame starts at ply {endgame_start['ply']} "
+            f"({endgame_start['reason']})"
+        )
+    board = chess.Board(start_fen)
+    print(analyzer.describe_board(board))
+    for entry in moves:
+        move = chess.Move.from_uci(entry["uci"])
+        if move not in board.legal_moves:
+            print(
+                f"[GAME] Illegal move encountered in log: {entry['uci']} "
+                f"(ply {entry['ply']}, player {entry['player']})"
+            )
+            break
+        board.push(move)
+        reward_total = entry.get("reward_total", 0.0)
+        reward_terminal = entry.get("reward_terminal", 0.0)
+        reward_shaping = entry.get("reward_shaping", 0.0)
+        print(
+            f"\n[PLY {entry['ply']}] {entry['player']} "
+            f"{entry.get('san', '')} ({entry['uci']}) via {entry.get('by', 'agent')} | "
+            f"reward {reward_total:+.3f} (terminal {reward_terminal:+.3f}, shaping {reward_shaping:+.3f})"
+        )
+        snapshot = entry.get("endgame_snapshot")
+        if snapshot:
+            print(
+                f"[ENDGAME SNAPSHOT] FEN: {snapshot['fen']}\n"
+                f"{snapshot['analysis']}"
+            )
+        policy_metrics = entry.get("policy_metrics")
+        value_before = entry.get("value_before")
+        value_after = entry.get("value_after")
+
+        if policy_metrics:
+            print(
+                f"[POLICY] entropy={policy_metrics['entropy']:.3f} "
+                f"gap={policy_metrics['action_value_gap']:.3f} "
+                f"top={policy_metrics['top_moves']} "
+                f"V_before={value_before:.3f} V_after={value_after if value_after is not None else float('nan'):.3f}"
+            )
+        print(analyzer.describe_board(board))
+
+def resolve_outcome(result, agent_color, opponent_label):
+    if result == "1-0":
+        winner_side = "white"
+    elif result == "0-1":
+        winner_side = "black"
+    elif result == "1/2-1/2":
+        winner_side = "draw"
+    else:
+        winner_side = "unknown"
+
+    agent_side = "white" if agent_color == chess.WHITE else "black"
+    opponent_side = "black" if agent_side == "white" else "white"
+
+    if winner_side == "draw":
+        winner_label = "draw"
+    elif winner_side == agent_side:
+        winner_label = "agent"
+    elif winner_side == opponent_side:
+        winner_label = opponent_label
+    else:
+        winner_label = "unknown"
+
+    return {
+        "result": result,
+        "winner_side": winner_side,
+        "winner_label": winner_label,
+        "agent_side": agent_side,
+        "opponent_side": opponent_side,
+        "opponent_label": opponent_label,
+    }
+
+
+def build_policy_metrics(agent, state_np, legal_mask_np, idx_to_move, board, top_k=3):
+    state = torch.from_numpy(state_np).float().to(agent.device).unsqueeze(0)
+    legal_mask = torch.from_numpy(legal_mask_np).to(agent.device).unsqueeze(0)
+    with torch.no_grad():
+        logits = agent.actor(state) / max(agent.temperature, 1e-6)
+        masked_logits = logits.masked_fill(legal_mask == 0, -1e9)
+        dist = torch.distributions.Categorical(logits=masked_logits)
+        entropy = float(dist.entropy().item())
+        probs = dist.probs.squeeze(0)
+
+    legal_count = int(legal_mask_np.sum())
+    k = max(1, min(top_k, legal_count))
+    top_probs, top_indices = torch.topk(probs, k)
+    top_moves = []
+    for prob, idx in zip(top_probs.tolist(), top_indices.tolist()):
+        move = idx_to_move.get(int(idx))
+        if move is None:
+            continue
+        top_moves.append(
+            {
+                "uci": move.uci(),
+                "san": board.san(move),
+                "prob": float(prob),
+            }
+        )
+
+    action_value_gap = 0.0
+    if legal_count >= 2:
+        with torch.no_grad():
+            top2 = torch.topk(masked_logits, k=2, dim=-1).values.squeeze(0)
+            action_value_gap = float((top2[0] - top2[1]).item())
+
+    return {
+        "entropy": entropy,
+        "top_moves": top_moves,
+        "action_value_gap": action_value_gap,
+    }
+
+
+def build_endgame_snapshot(board, analyzer):
+    analysis = analyzer.analyze(board)
+    return {
+        "fen": board.fen(),
+        "board": board.unicode(),
+        "analysis": analyzer.format_analysis(analysis),
+        "endgame": analysis.endgame,
+        "endgame_reason": analysis.endgame_reason,
+    }
 
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    max_game_ply = 240
+    max_game_ply = None #240
     curriculum_stage = 0
     gate_hits = 0
     max_stage = 3
@@ -180,6 +317,8 @@ def main():
     # entropy_coef_min = 0.005
     # entropy_decay = 0.97
     smoothed_return = None
+    return_window = deque(maxlen=50)
+
 
 
     #run_name = f"{opponent.__class__.__name__}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
@@ -208,6 +347,10 @@ def main():
     log_dir = f"runs/{run_name}"
     os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=log_dir)
+    analyzer = BoardAnalyzer()
+    print_game_every = 1
+    endgame_log_plies = 30
+    top_k_policy_moves = 3
     game_log_path = os.path.join(log_dir, "games.jsonl")
     hparams = {
         "learning_rate_actor": 3e-4,
@@ -230,16 +373,20 @@ def main():
         "temperature_max": agent.temperature_max,
     }
     try:
-        # Start TensorBoard as background process
         tb_process = subprocess.Popen(
-            ["tensorboard", "--logdir", "runs", "--port", "6006"],
+            [sys.executable, "-m", "tensorboard.main", "--logdir", "runs", "--port", "6006"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        time.sleep(2)
 
-        # Auto-open browser tab
-        webbrowser.open("http://localhost:6006")
+        def _open_tb():
+            time.sleep(2)
+            try:
+                webbrowser.open_new_tab("http://localhost:6006")
+            except Exception:
+                pass
+
+        threading.Thread(target=_open_tb, daemon=True).start()
 
     except Exception as e:
         print(f"[WARN] Could not launch TensorBoard automatically: {e}")
@@ -253,6 +400,11 @@ def main():
         starting_fen = board.fen()
         game_moves = []
         final_info = None
+        opponent_label = "old_model" if use_self_play else "opponent"
+        endgame_started = False
+        endgame_start_ply = None
+        endgame_reason = None
+        endgame_capture_count = 0
 
         if use_self_play:
             snap = opponent_pool.sample()
@@ -269,10 +421,18 @@ def main():
         active_fixed_opponent = None
         if np.random.rand() < fixed_opponent_prob:
             active_fixed_opponent = random.choice(fixed_opponents)
+            opponent_label = active_fixed_opponent[0]
 
         while not done:
             state_np = flatten_obs(obs)
             board_before = board.copy(stack=False)
+            board_analysis = analyzer.analyze(board_before)
+            if board_analysis.endgame and not endgame_started:
+                endgame_started = True
+                endgame_start_ply = base_env.move_count
+                endgame_reason = board_analysis.endgame_reason
+            if timestep % 200 == 0:
+                print(f"timestep={timestep} ep_len={ep_len} fen={board.fen()}")
 
             # ----------------------------------------
             # BUILD LEGAL MOVES + INDEX MAP
@@ -315,6 +475,16 @@ def main():
             legal_mask_np[idxs] = 1.0
 
             action_id, logprob, value = agent.select_action(state_np, legal_mask_np)
+            policy_metrics = None
+            if endgame_started and endgame_capture_count < endgame_log_plies:
+                policy_metrics = build_policy_metrics(
+                    agent,
+                    state_np,
+                    legal_mask_np,
+                    idx_to_move,
+                    board_before,
+                    top_k=top_k_policy_moves,
+                )
             move = idx_to_move.get(action_id)
             if move is None:
                 raise RuntimeError(
@@ -341,6 +511,23 @@ def main():
             # ----------------------------------------
             ply_count = base_env.move_count + 1
             san_move = board_before.san(move)
+            obs_next, reward_agent, terminated, truncated, info_agent = env.step(move)
+            done = terminated or truncated
+            if done:
+                final_info = info_agent
+
+            # Opponent (self-play) move before storing transition so the reward
+            # reflects the full ply outcome.
+            combined_reward = reward_agent
+            ep_reward += reward_agent
+            ep_len += 1
+            endgame_snapshot = None
+            if endgame_started and endgame_capture_count < endgame_log_plies:
+                endgame_snapshot = build_endgame_snapshot(board_before, analyzer)
+                endgame_capture_count += 1
+            value_after = None
+            if not done:
+                value_after = agent.evaluate_value(flatten_obs(obs_next))
             game_moves.append(
                 {
                     "ply": ply_count,
@@ -348,17 +535,31 @@ def main():
                     "uci": move.uci(),
                     "san": san_move,
                     "by": "agent",
+                    "reward_total": info_agent.get("reward_total", reward_agent),
+                    "reward_terminal": info_agent.get("reward_terminal", 0.0),
+                    "reward_shaping": info_agent.get("reward_shaping", 0.0),
+                    "reward_breakdown": info_agent.get("reward_breakdown", {}),
+                    "endgame_snapshot": endgame_snapshot,
+                    "policy_metrics": policy_metrics,
+                    "value_before": value,
+                    "value_after": value_after,
                 }
             )
-            obs_next, reward_agent, terminated, truncated, info = env.step(move)
-            done = terminated or truncated
+            # obs_next, reward_agent, terminated, truncated, info = env.step(move)
+            # done = terminated or truncated
 
             # Opponent (self-play) move before storing transition so the reward
             # reflects the full ply outcome.
-            combined_reward = reward_agent
-            ep_reward += reward_agent
-            ep_len += 1
+            # combined_reward = reward_agent
+            # ep_reward += reward_agent
+            # ep_len += 1
             if not done:
+                if not endgame_started:
+                    opp_analysis = analyzer.analyze(board)
+                    if opp_analysis.endgame:
+                        endgame_started = True
+                        endgame_start_ply = base_env.move_count
+                        endgame_reason = opp_analysis.endgame_reason
                 #if use_self_play:
                 # opp_move, _ = self_play_opponent.select_move(board, obs_next)
                 #else:
@@ -374,19 +575,35 @@ def main():
                     opp_board_before = board.copy(stack=False)
                     opp_ply = base_env.move_count + 1
                     opp_san = opp_board_before.san(opp_move)
-                    obs_after_opp, reward_opp, terminated_opp, truncated_opp, info = env.step(opp_move)
+                    obs_after_opp, reward_opp, terminated_opp, truncated_opp, info_opp = env.step(opp_move)
+                    # obs_after_opp, reward_opp, terminated_opp, truncated_opp, info = env.step(opp_move)
                     combined_reward += reward_opp
                     ep_reward += reward_opp
                     ep_len += 1
                     done = terminated_opp or truncated_opp
+                    if done:
+                        final_info = info_opp
                     obs_next = obs_after_opp
+                    opp_snapshot = None
+                    if endgame_started and endgame_capture_count < endgame_log_plies:
+                        opp_snapshot = build_endgame_snapshot(opp_board_before, analyzer)
+                        endgame_capture_count += 1
                     game_moves.append(
                         {
                             "ply": opp_ply,
                             "player": "white" if opp_board_before.turn == chess.WHITE else "black",
                             "uci": opp_move.uci(),
                             "san": opp_san,
-                            "by": active_fixed_opponent[0] if active_fixed_opponent else "self_play_snapshot",
+                            # "by": active_fixed_opponent[0] if active_fixed_opponent else "self_play_snapshot",
+                            "by": opponent_label,
+                            "reward_total": info_opp.get("reward_total", reward_opp),
+                            "reward_terminal": info_opp.get("reward_terminal", 0.0),
+                            "reward_shaping": info_opp.get("reward_shaping", 0.0),
+                            "reward_breakdown": info_opp.get("reward_breakdown", {}),
+                            "endgame_snapshot": opp_snapshot,
+                            "policy_metrics": None,
+                            "value_before": None,
+                            "value_after": None,
                         }
                     )
 
@@ -489,19 +706,46 @@ def main():
                 done = True
                 break
 
-        final_info = info
+        # final_info = info
+
         episode += 1
+        return_per_ply = ep_reward / max(1, ep_len)
+        if smoothed_return is None:
+            smoothed_return = ep_reward
+        else:
+            smoothed_return = 0.9 * smoothed_return + 0.1 * ep_reward
+        return_window.append(ep_reward)
+        rolling_return = float(np.mean(return_window))
+
+        result_string = (final_info or {}).get("result", board.result())
+        outcome_summary = resolve_outcome(result_string, agent_color, opponent_label)
+        if endgame_start_ply is None:
+            endgame_start_ply = None
+            endgame_reason = "not_reached"
+        endgame_start = {"ply": endgame_start_ply, "reason": endgame_reason or "not_reached"}
         # agent_color = np.random.choice([chess.WHITE, chess.BLACK])
         try:
             with open(game_log_path, "a", encoding="utf-8") as f:
                 json.dump(
                     {
                         "episode": episode,
-                        "agent_color": "white" if agent_color == chess.WHITE else "black",
-                        "result": (final_info or {}).get("result", board.result()),
+                        # "agent_color": "white" if agent_color == chess.WHITE else "black",
+                        # "result": (final_info or {}).get("result", board.result()),
+                        "agent_color": outcome_summary["agent_side"],
+                        "opponent_color": outcome_summary["opponent_side"],
+                        "opponent_label": opponent_label,
+                        "result": outcome_summary["result"],
+                        "winner": outcome_summary["winner_label"],
                         "terminal_reason": (final_info or {}).get("terminal_reason"),
                         "forced_draw": (final_info or {}).get("forced_draw", False),
                         "start_fen": starting_fen,
+                        "endgame_start_ply": endgame_start["ply"],
+                        "endgame_start_reason": endgame_start["reason"],
+                        "episode_return": ep_reward,
+                        "episode_length": ep_len,
+                        "return_per_ply": return_per_ply,
+                        "return_smooth": smoothed_return,
+                        "return_window_avg": rolling_return,
                         "moves": game_moves,
                     },
                     f,
@@ -510,13 +754,25 @@ def main():
         except Exception as e:
             print(f"[WARN] Failed to log game for episode {episode}: {e}")
 
-        print(f"Episode {episode} | Return={ep_reward:.2f} | Length={ep_len}")
-        if smoothed_return is None:
-            smoothed_return = ep_reward
-        else:
-            smoothed_return = 0.9 * smoothed_return + 0.1 * ep_reward
+        if print_game_every > 0 and episode % print_game_every == 0:
+            print_game_with_analysis(game_moves, starting_fen, episode, analyzer,  outcome_summary, endgame_start)
+
+        # print(f"Episode {episode} | Return={ep_reward:.2f} | Length={ep_len}")
+        # if smoothed_return is None:
+        #    smoothed_return = ep_reward
+        # else:
+        #     smoothed_return = 0.9 * smoothed_return + 0.1 * ep_reward
+        if print_game_every > 0 and episode % print_game_every == 0:
+            print_game_with_analysis(game_moves, starting_fen, episode, analyzer, outcome_summary, endgame_start)
+
+        print(
+            f"Episode {episode} | Return={ep_reward:.2f} | Return/Ply={return_per_ply:.3f} | "
+            f"Smooth={smoothed_return:.2f} | WindowAvg={rolling_return:.2f} | Length={ep_len}"
+        )
         writer.add_scalar("Episode/return", ep_reward, episode)
         writer.add_scalar("Episode/return_smooth", smoothed_return, episode)
+        writer.add_scalar("Episode/return_per_ply", return_per_ply, episode)
+        writer.add_scalar("Episode/return_window_avg", rolling_return, episode)
         writer.add_scalar("Episode/length", ep_len, episode)
 
     print("Training finished.")

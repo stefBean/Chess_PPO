@@ -100,15 +100,33 @@ class RewardShaper:
     def shaped_reward(self, board_before, board_after, move, move_count):
         reward = 0.0
 
+    def _blank_breakdown(self) -> dict:
+        return {
+            "capture": 0.0,
+            "check": 0.0,
+            "pawn_progress": 0.0,
+            "king_activity": 0.0,
+            "mate_pressure": 0.0,
+            "repetition": 0.0,
+            "stalling": 0.0,
+            "total": 0.0,
+        }
+
+    def shaped_reward_breakdown(self, board_before, board_after, move, move_count) -> dict:
+        breakdown = self._blank_breakdown()
+
         # --- Capture ---
         if board_before.is_capture(move):
             captured_piece = board_before.piece_at(move.to_square)
             if captured_piece:
-                reward += self.capture_reward * (self.material_value(captured_piece.piece_type) / 10.0)
+                breakdown["capture"] = (
+                        self.capture_reward * (self.material_value(captured_piece.piece_type) / 10.0)
+                )
+                # reward += self.capture_reward * (self.material_value(captured_piece.piece_type) / 10.0)
 
         # --- Check ---
         if board_after.is_check():
-            reward += self.check_reward
+            # reward += self.check_reward
 
         # # --- Pawn push forward ---
         # piece = board_before.piece_at(move.from_square)
@@ -137,16 +155,41 @@ class RewardShaper:
         #         reward += self.piece_development_reward
 
         # --- Endgame pawn and king incentives ---
-        reward += self._pawn_progress(board_before, board_after, move)
-        reward += self._king_activity(board_before, board_after, move)
-        reward += self._mate_pressure(board_after)
+        # reward += self._pawn_progress(board_before, board_after, move)
+        # reward += self._king_activity(board_before, board_after, move)
+        # reward += self._mate_pressure(board_after)
 
         # --- Repetitive movement penalty ---
+            breakdown["check"] = self.check_reward
+
+        breakdown["pawn_progress"] = self._pawn_progress(board_before, board_after, move)
+        breakdown["king_activity"] = self._king_activity(board_before, board_after, move)
+        breakdown["mate_pressure"] = self._mate_pressure(board_after)
         if board_after.can_claim_threefold_repetition():
-            reward += self.repeat_penalty
+            # reward += self.repeat_penalty
+            breakdown["repetition"] = self.repeat_penalty
 
         # --- Stall penalty (too many moves) ---
         if move_count > 160:
-            reward += self.stalling_penalty
+            # reward += self.stalling_penalty
 
-        return reward
+        # return reward
+            breakdown["stalling"] = self.stalling_penalty
+
+        breakdown["total"] = sum(
+            breakdown[key]
+            for key in (
+                "capture",
+                "check",
+                "pawn_progress",
+                "king_activity",
+                "mate_pressure",
+                "repetition",
+                "stalling",
+            )
+        )
+        return breakdown
+
+    def shaped_reward(self, board_before, board_after, move, move_count):
+        breakdown = self.shaped_reward_breakdown(board_before, board_after, move, move_count)
+        return breakdown["total"]
