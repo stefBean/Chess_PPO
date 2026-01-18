@@ -20,6 +20,7 @@ class RewardShaper:
         self.promotion_bonus = 0.35
         self.king_activity_weight = 0.01
         self.mate_pressure_bonus = 0.05
+        self.checkmate_bonus = 0.5
         self.repeat_penalty = -0.08
         self.stalling_penalty = -0.01
 
@@ -97,6 +98,12 @@ class RewardShaper:
             pressure += self.mate_pressure_bonus * (1.0 + scarcity_factor)
         return pressure
 
+    def terminal_bonus(self, board_after: chess.Board) -> float:
+        """Bonus for delivering checkmate to encourage finishing games."""
+        if board_after.is_checkmate():
+            return self.checkmate_bonus
+        return 0.0
+
     def shaped_reward(self, board_before, board_after, move, move_count):
         reward = 0.0
 
@@ -109,6 +116,7 @@ class RewardShaper:
             "mate_pressure": 0.0,
             "repetition": 0.0,
             "stalling": 0.0,
+            "terminal_bonus": 0.0,
             "total": 0.0,
         }
 
@@ -126,40 +134,6 @@ class RewardShaper:
 
         # --- Check ---
         if board_after.is_check():
-            # reward += self.check_reward
-
-        # # --- Pawn push forward ---
-        # piece = board_before.piece_at(move.from_square)
-        # if piece and piece.piece_type == chess.PAWN:
-        #     from_rank = chess.square_rank(move.from_square)
-        #     to_rank = chess.square_rank(move.to_square)
-        #     if piece.color and to_rank > from_rank:    # white pawn moves up
-        #         reward += self.pawn_push_reward
-        #     if not piece.color and to_rank < from_rank:  # black pawn moves down
-        #         reward += self.pawn_push_reward
-        #
-        # # --- Castling ---
-        # if board_before.is_castling(move):
-        #     reward += self.castle_reward
-        #
-        # # --- Development ---
-        # if piece and piece.piece_type in {chess.KNIGHT, chess.BISHOP}:
-        #     starting_squares = {
-        #         chess.WHITE: {1, 6},   # b1, g1
-        #         chess.BLACK: {57, 62}  # b8, g8
-        #     } if piece.piece_type == chess.KNIGHT else {
-        #         chess.WHITE: {2, 5},   # c1, f1
-        #         chess.BLACK: {58, 61}  # c8, f8
-        #     }
-        #     if move.from_square in starting_squares[piece.color]:
-        #         reward += self.piece_development_reward
-
-        # --- Endgame pawn and king incentives ---
-        # reward += self._pawn_progress(board_before, board_after, move)
-        # reward += self._king_activity(board_before, board_after, move)
-        # reward += self._mate_pressure(board_after)
-
-        # --- Repetitive movement penalty ---
             breakdown["check"] = self.check_reward
 
         breakdown["pawn_progress"] = self._pawn_progress(board_before, board_after, move)
@@ -171,9 +145,6 @@ class RewardShaper:
 
         # --- Stall penalty (too many moves) ---
         if move_count > 160:
-            # reward += self.stalling_penalty
-
-        # return reward
             breakdown["stalling"] = self.stalling_penalty
 
         breakdown["total"] = sum(
@@ -186,6 +157,7 @@ class RewardShaper:
                 "mate_pressure",
                 "repetition",
                 "stalling",
+                "terminal_bonus",
             )
         )
         return breakdown

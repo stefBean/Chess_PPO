@@ -229,7 +229,7 @@ def build_policy_metrics(agent, state_np, legal_mask_np, idx_to_move, board, top
     action_value_gap = 0.0
     if legal_count >= 2:
         with torch.no_grad():
-            top2 = torch.topk(masked_logits, k=2, dim=-1).values.squeeze(0)
+            top2 = torch.topk(probs, k=2, dim=-1).values.squeeze(0)
             action_value_gap = float((top2[0] - top2[1]).item())
 
     return {
@@ -499,13 +499,7 @@ def main():
                     f"Action id {action_id} not in idx_to_move (mask/encoding mismatch). "
                     f"Legal idx count={len(idxs)} fen={board.fen()}"
                 )
-            # move = idx_to_move.get(action_id, np.random.choice(list(board.legal_moves)))
-            # # Map selected action to legal move
-            # if action_id not in move:
-            #     # Very rare fallback: sample a legal move directly
-            #     move = np.random.choice(legal_moves)
-            # else:
-            #     move = idx_to_move[action_id]
+
 
             # Final safety check
             if move not in board.legal_moves:
@@ -711,11 +705,18 @@ def main():
                 writer.add_scalar("Loss/entropy_coef", metrics["entropy_coef"], timestep)
                 writer.add_scalar("KL/approx_kl", metrics["approx_kl"], timestep)
                 writer.add_scalar("KL/policy_shift", metrics["policy_shift_kl"], timestep)
+                writer.add_scalar("KL/policy_update", metrics["policy_update_kl"], timestep)
+                writer.add_scalar("Advantage/raw_mean", metrics["advantages_raw_mean"], timestep)
+                writer.add_scalar("Advantage/raw_std", metrics["advantages_raw_std"], timestep)
+                writer.add_scalar("Advantage/normalized_mean", metrics["advantages_norm_mean"], timestep)
+                writer.add_scalar("Advantage/normalized_std", metrics["advantages_norm_std"], timestep)
                 writer.add_scalar("Policy/expected_advantage", metrics["expected_advantage"], timestep)
                 writer.add_scalar("Policy/action_value_gap", metrics["action_value_gap"], timestep)
                 writer.add_scalar("Policy/policy_entropy", metrics["entropy"], timestep)
                 writer.add_scalar("Policy/policy_entropy_normalized", metrics["normalized_entropy"], timestep)
                 writer.add_scalar("Policy/entropy_target", agent.entropy_target, timestep)
+                writer.add_scalar("Policy/entropy_schedule_progress", progress, timestep)
+                writer.add_scalar("Policy/entropy_schedule_progress", progress, timestep)
                 writer.add_scalar("Policy/temperature", metrics["temperature"], timestep)
                 writer.add_scalar("Optimization/minibatches", metrics["updates_run"], timestep)
                 writer.add_scalar("Timesteps/timestep", timestep, timestep)
