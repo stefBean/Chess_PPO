@@ -188,6 +188,8 @@ class Chess(gym.Env):
         # terminated = board_after.is_game_over()
         # truncated = False
         reward_terminal = 0.0
+        reward_terminal_bonus = 0.0
+        terminal_reason = None
         done = terminated or truncated
         if done:
         #if terminated:
@@ -200,6 +202,7 @@ class Chess(gym.Env):
             #    reward_terminal = 0.0
             if forced_draw:
                 reward_terminal = 0.0
+                terminal_reason = "max_ply"
             else:
                 res = board_after.result()
                 if res == "1-0":
@@ -208,6 +211,17 @@ class Chess(gym.Env):
                     reward_terminal = +1.0 if mover == chess.BLACK else -1.0
                 else:
                     reward_terminal = 0.0
+                if board_after.is_checkmate():
+                    terminal_reason = "checkmate"
+                elif board_after.is_stalemate():
+                    terminal_reason = "stalemate"
+                elif board_after.is_insufficient_material():
+                    terminal_reason = "insufficient_material"
+                else:
+                    terminal_reason = "rule_termination"
+                if reward_terminal != 0.0:
+                    reward_terminal_bonus = self.shaper.terminal_bonus(board_after)
+                    reward_terminal += reward_terminal_bonus
 
         if not done: #terminated:
             # reward_shaping = self.shaper.shaped_reward
@@ -221,6 +235,9 @@ class Chess(gym.Env):
         else:
             reward_breakdown = self.shaper._blank_breakdown()
             reward_shaping = 0.0
+            if reward_terminal_bonus != 0.0:
+                reward_breakdown["terminal_bonus"] = reward_terminal_bonus
+                reward_breakdown["total"] = reward_terminal_bonus
 
         reward = reward_terminal + reward_shaping
 
@@ -229,9 +246,10 @@ class Chess(gym.Env):
         info = {
             "result": result_string,
             "legal_moves": list(map(str, self._board.legal_moves)),
-            "terminal_reason": "max_ply" if forced_draw else "rule_termination" if terminated else None,
+            "terminal_reason": terminal_reason,
             "forced_draw": forced_draw,
             "reward_terminal": reward_terminal,
+            "reward_terminal_bonus": reward_terminal_bonus,
             "reward_shaping": reward_shaping,
             "reward_total": reward,
             "reward_breakdown": reward_breakdown,
