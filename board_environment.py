@@ -175,7 +175,7 @@ class Chess(gym.Env):
         #if self.move_count >= self.max_ply:
         max_ply_limit = self.max_ply is not None and self.max_ply > 0
         if max_ply_limit and self.move_count >= self.max_ply:
-            terminated = True
+            terminated = False
             forced_draw = True
             truncated = True
         else:
@@ -188,7 +188,9 @@ class Chess(gym.Env):
         # terminated = board_after.is_game_over()
         # truncated = False
         reward_terminal = 0.0
-        if terminated:
+        done = terminated or truncated
+        if done:
+        #if terminated:
             #res = board_after.result()
             #if res == "1-0":
             #    reward_terminal = +1.0 if mover == chess.WHITE else -1.0
@@ -207,7 +209,7 @@ class Chess(gym.Env):
                 else:
                     reward_terminal = 0.0
 
-        if not terminated:
+        if not done: #terminated:
             # reward_shaping = self.shaper.shaped_reward
             reward_breakdown = self.shaper.shaped_reward_breakdown(
                 board_before,
@@ -235,7 +237,8 @@ class Chess(gym.Env):
             "reward_breakdown": reward_breakdown,
         }
 
-        if terminated or truncated:
+        if done:
+        # if terminated or truncated:
             self._ready = False
 
         return observation, reward, terminated, truncated, info

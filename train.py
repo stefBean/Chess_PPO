@@ -138,10 +138,16 @@ def print_game_with_analysis(moves, start_fen, episode, analyzer, outcome_summar
         reward_total = entry.get("reward_total", 0.0)
         reward_terminal = entry.get("reward_terminal", 0.0)
         reward_shaping = entry.get("reward_shaping", 0.0)
+        check_before = entry.get("check_before")
+        check_after = entry.get("check_after")
+        check_note = ""
+        if check_before is not None or check_after is not None:
+            check_note = f" | check_before={check_before} check_after={check_after}"
         print(
             f"\n[PLY {entry['ply']}] {entry['player']} "
             f"{entry.get('san', '')} ({entry['uci']}) via {entry.get('by', 'agent')} | "
             f"reward {reward_total:+.3f} (terminal {reward_terminal:+.3f}, shaping {reward_shaping:+.3f})"
+            f"{check_note}"
         )
         snapshot = entry.get("endgame_snapshot")
         if snapshot:
@@ -459,12 +465,14 @@ def main():
             if not idxs:
                 reward = -1.0
                 done = True
+                terminal = True
                 agent.store_transition(
                     state_np,
                     0,
                     0.0,
                     reward,
                     done,
+                    terminal,
                     0.0,
                     0.0,
                     np.zeros(action_dim, dtype=np.float32),
@@ -513,6 +521,9 @@ def main():
             san_move = board_before.san(move)
             obs_next, reward_agent, terminated, truncated, info_agent = env.step(move)
             done = terminated or truncated
+            terminal = terminated
+            check_before = board_before.is_check()
+            check_after = base_env._board.is_check()
             if done:
                 final_info = info_agent
 
@@ -543,6 +554,8 @@ def main():
                     "policy_metrics": policy_metrics,
                     "value_before": value,
                     "value_after": value_after,
+                    "check_before": check_before,
+                    "check_after": check_after,
                 }
             )
             # obs_next, reward_agent, terminated, truncated, info = env.step(move)
@@ -570,6 +583,7 @@ def main():
                     opp_move = active_fixed_opponent[1].choose_move(board)
                 if opp_move is None:
                     done = True
+                    terminal = True
                     combined_reward = reward_agent + 1.0
                 else:
                     opp_board_before = board.copy(stack=False)
@@ -581,6 +595,9 @@ def main():
                     ep_reward += reward_opp
                     ep_len += 1
                     done = terminated_opp or truncated_opp
+                    terminal = terminated_opp
+                    opp_check_before = opp_board_before.is_check()
+                    opp_check_after = base_env._board.is_check()
                     if done:
                         final_info = info_opp
                     obs_next = obs_after_opp
@@ -604,12 +621,14 @@ def main():
                             "policy_metrics": None,
                             "value_before": None,
                             "value_after": None,
+                            "check_before": opp_check_before,
+                            "check_after": opp_check_after,
                         }
                     )
 
             # Bootstrap value for the next state to stabilize advantage estimates.
             next_value = 0.0
-            if not done:
+            if not terminal:
                 next_state_np = flatten_obs(obs_next)
                 next_value = agent.evaluate_value(next_state_np)
 
@@ -618,7 +637,7 @@ def main():
                 action_id,
                 logprob,
                 combined_reward,
-                done,
+                terminal,
                 value,
                 next_value,
                 legal_mask_np,
