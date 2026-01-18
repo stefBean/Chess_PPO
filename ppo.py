@@ -110,9 +110,9 @@ class PPO:
             logits = self.actor(state) / max(self.temperature, 1e-6)
             mask_tensor = legal_mask == 0
             masked_logits = logits.masked_fill(mask_tensor, -1e9)
-            top2 = torch.topk(masked_logits, k=2, dim=-1).values
-            gap = (top2[:, 0] - top2[:, 1]).mean()
             dist = Categorical(logits=masked_logits)
+            top2 = torch.topk(dist.probs, k=2, dim=-1).values
+            gap = (top2[:, 0] - top2[:, 1]).mean()
             action = dist.sample()
             logprob = dist.log_prob(action)
             value = self.critic(state).squeeze(-1)
@@ -206,7 +206,11 @@ class PPO:
 
         bootstrap_value = 0.0 if len(dones) == 0 or dones[-1] == 1.0 else float(next_values[-1])
         advantages_raw, returns = self.compute_gae(rewards, dones, values, next_values, bootstrap_value)
+        advantages_raw_mean = float(advantages_raw.mean().item()) if advantages_raw.numel() else 0.0
+        advantages_raw_std = float(advantages_raw.std().item()) if advantages_raw.numel() else 0.0
         advantages = (advantages_raw - advantages_raw.mean()) / (advantages_raw.std() + 1e-8)
+        advantages_norm_mean = float(advantages.mean().item()) if advantages.numel() else 0.0
+        advantages_norm_std = float(advantages.std().item()) if advantages.numel() else 0.0
 
         dataset_size = states.size(0)
         indices = np.arange(dataset_size)
@@ -223,6 +227,7 @@ class PPO:
         expected_adv_terms = []
         action_value_gaps = []
         policy_shift_kls = []
+        policy_update_kl = 0.0
         actor_losses = []
         critic_losses = []
         approx_kls = []
@@ -308,16 +313,8 @@ class PPO:
 
                 # Action-value gap: difference between the most and second-most probable legal actions
                 probs = dist.probs
-                top2 = torch.topk(masked_logits, k=2, dim=1).values
+                top2 = torch.topk(probs, k=2, dim=1).values
                 gap_batch = top2[:, 0] - top2[:, 1]
-                action_value_gaps.append(gap_batch.mean().detach())
-
-                # top_k = min(2, probs.shape[-1])
-                # top_vals, _ = torch.topk(probs, k=top_k, dim=1)
-                # if top_k == 1:
-                #     gap_batch = top_vals[:, 0]
-                # else:
-                #     gap_batch = top_vals[:, 0] - top_vals[:, 1]
                 action_value_gaps.append(gap_batch.mean().detach())
 
                 # KL divergence to previous policy snapshot (policy shift)
@@ -345,6 +342,16 @@ class PPO:
             updated_temp = self.temperature + self.temperature_lr * entropy_error
             self.temperature = float(np.clip(updated_temp, self.temperature_min, self.temperature_max))
 
+        if dataset_size > 0:
+            with torch.no_grad():
+                new_logits = self.actor(states) / max(self.temperature, 1e-6)
+                new_masked_logits = new_logits.masked_fill(masks == 0, -1e9)
+                new_dist = Categorical(logits=new_masked_logits)
+                old_dist_full = Categorical(logits=old_masked_logits)
+                policy_update_kl = float(
+                    torch.distributions.kl_divergence(old_dist_full, new_dist).mean().item()
+                )
+
         self.buffer.clear()
         return {
             # "actor_loss": actor_loss.item(),
@@ -358,10 +365,14 @@ class PPO:
             "expected_advantage": float(torch.stack(expected_adv_terms).mean().item()) if expected_adv_terms else 0.0,
             "action_value_gap": float(torch.stack(action_value_gaps).mean().item()) if action_value_gaps else 0.0,
             "policy_shift_kl": float(torch.stack(policy_shift_kls).mean().item()) if policy_shift_kls else 0.0,
+            "policy_update_kl": policy_update_kl,
             "actor_loss": float(torch.stack(actor_losses).mean().item()) if actor_losses else 0.0,
             "critic_loss": float(torch.stack(critic_losses).mean().item()) if critic_losses else 0.0,
             "approx_kl": float(torch.stack(approx_kls).mean().item()) if approx_kls else 0.0,
-
+            "advantages_raw_mean": advantages_raw_mean,
+            "advantages_raw_std": advantages_raw_std,
+            "advantages_norm_mean": advantages_norm_mean,
+            "advantages_norm_std": advantages_norm_std,
         }
 
     # ==========================================================
