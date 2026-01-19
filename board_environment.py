@@ -103,7 +103,7 @@ class Chess(gym.Env):
         self._full_endgame_scenarios = self._enumerate_endgame_scenarios()
         self.curriculum_stage = 0
         self._curriculum_sorted = None
-        self._curriculum_stage_fracs = [0.15, 0.40, 0.70, 1.0]
+        self._curriculum_stage_fracs = [0.10, 0.30, 0.60, 1.0]
 
         #: Indicates whether the env has been reset since it has been created
         #: or the previous game has ended.
@@ -418,10 +418,15 @@ class Chess(gym.Env):
         frac = self._curriculum_stage_fracs[stage]
         k = max(1, int(len(self._curriculum_sorted) * frac))
         candidate_scenarios = self._curriculum_sorted[:k]
+        difficulty_bias = 0.6 + 0.4 * stage
+        scenario_weights = [
+            (self._scenario_difficulty(scenario) + 1e-3) ** difficulty_bias
+            for scenario in candidate_scenarios
+        ]
 
         # Also allow mirroring colors for diversity
         for _ in range(400):
-            scenario = random.choice(candidate_scenarios)
+            scenario = random.choices(candidate_scenarios, weights=scenario_weights, k=1)[0]
             if random.random() < 0.5:
                 scenario = {"white": scenario["black"], "black": scenario["white"]}
 

@@ -49,9 +49,17 @@ def quick_eval_gate(
     history_length: int = 2,
     curriculum_stage: int = 0,
     temperature: float = 1.0,
+    endgame_max_extra_per_side: int = 4,
+    endgame_min_extra_total: int = 3,
+    require_pawn: bool = False,
 ):
     """Lightweight evaluation to decide if a snapshot enters the pool."""
-    base_env = Chess(start_mode="curriculum_endgame", endgame_max_extra_per_side=3)
+    base_env = Chess(
+        start_mode="curriculum_endgame",
+        endgame_max_extra_per_side=endgame_max_extra_per_side,
+        endgame_min_extra_total=endgame_min_extra_total,
+        require_pawn=require_pawn,
+    )
     env_eval = BoardEncoding(base_env, history_length=history_length)
     random_opp = RandomOpponent()
     total_score = 0.0
@@ -253,6 +261,9 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     max_game_ply = None #240
     curriculum_stage = 0
+    endgame_max_extra_per_side = 4
+    endgame_min_extra_total = 3
+    require_pawn = False
     gate_hits = 0
     max_stage = 3
     threshold = 0.60
@@ -264,9 +275,9 @@ def main():
     # conversion/defense scenarios.
     base_env = Chess(
         start_mode="curriculum_endgame",
-        endgame_max_extra_per_side=3,
-        endgame_min_extra_total=1,
-        require_pawn=False,
+        endgame_max_extra_per_side=endgame_max_extra_per_side,
+        endgame_min_extra_total=endgame_min_extra_total,
+        require_pawn=require_pawn,
     )
     env = BoardEncoding(base_env, history_length=2)
     encoder = AlphaZeroActionEncoder()
@@ -278,8 +289,8 @@ def main():
 
     print(f"State dim: {state_dim}, Action dim: {action_dim}, Device: {device}")
 
-    entropy_target_start = 0.65
-    entropy_target_end = 0.25
+    entropy_target_start = 0.75
+    entropy_target_end = 0.20
 
     agent = PPO(
         state_dim=state_dim,
@@ -302,7 +313,7 @@ def main():
         entropy_target=entropy_target_start,
         entropy_coef_lr=0.005,
         entropy_coef_min=0.002,
-        entropy_coef_max=0.08,
+        entropy_coef_max=0.10,
         temperature=1.0,
         temperature_lr=0.01,
         temperature_min=0.7,
@@ -654,7 +665,6 @@ def main():
                 update_count += 1
 
                 if update_count % snapshot_every == 0:
-                    # gate_score = quick_eval_gate(agent.actor, encoder, flatten_obs, agent.device, curriculum_stage=curriculum_stage)
                     gate_score = quick_eval_gate(
                         agent.actor,
                         encoder,
@@ -662,6 +672,9 @@ def main():
                         agent.device,
                         curriculum_stage=curriculum_stage,
                         temperature=agent.temperature,
+                        endgame_max_extra_per_side=endgame_max_extra_per_side,
+                        endgame_min_extra_total=endgame_min_extra_total,
+                        require_pawn=require_pawn,
                     )
                     if gate_score >= -0.15:
                         opponent_pool.add(agent.actor)

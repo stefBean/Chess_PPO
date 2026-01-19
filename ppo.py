@@ -112,7 +112,6 @@ class PPO:
             masked_logits = logits.masked_fill(mask_tensor, -1e9)
             dist = Categorical(logits=masked_logits)
             top2 = torch.topk(dist.probs, k=2, dim=-1).values
-            gap = (top2[:, 0] - top2[:, 1]).mean()
             dist = Categorical(logits=masked_logits)
             action = dist.sample()
             logprob = dist.log_prob(action)
