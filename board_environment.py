@@ -83,9 +83,9 @@ class Chess(gym.Env):
             start_mode: str = "standard",
             endgame_scenarios: Optional[List[Dict[str, List[chess.PieceType]]]] = None,
             endgame_max_extra_per_side: int = 3,
-            endgame_min_extra_total: int = 2,
-            require_pawn: bool = True,
-            require_material_edge: bool = True,
+            endgame_min_extra_total: int = 0,
+            require_pawn: bool = False,
+            require_material_edge: bool = False,
     ) -> None:
     # def __init__(self) -> None:
         #: The underlying chess.Board instance that represents the game.
@@ -98,7 +98,7 @@ class Chess(gym.Env):
         self.endgame_min_extra_total = endgame_min_extra_total
         self.require_pawn = require_pawn
         self.require_material_edge = require_material_edge
-        self.max_ply: int | None = 200 #200
+        self.max_ply: int | None = None #200
         self.no_progress = 0
         self._full_endgame_scenarios = self._enumerate_endgame_scenarios()
         self.curriculum_stage = 0
@@ -348,7 +348,7 @@ class Chess(gym.Env):
             placed_pawn = False
 
             for color in (chess.WHITE, chess.BLACK):
-                extras = random.randint(1, self.endgame_max_extra_per_side)
+                extras = random.randint(0, self.endgame_max_extra_per_side)
                 for _ in range(extras):
                     piece_type = random.choice(piece_pool)
                     square = self._sample_square(board, occupied, piece_type, color)
