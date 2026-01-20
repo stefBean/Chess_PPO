@@ -3,10 +3,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import os
-import math
 from torch.distributions import Categorical
 from torch.optim import Adam
-
 from actor import Actor
 from critic import Critic
 
@@ -22,11 +20,12 @@ class RolloutBuffer:
         self.next_values = []
         self.masks = []
         self.final_value = 0.0
+        self.terminals = []
 
     def clear(self):
         self.__init__()
 
-    def add(self, state, action, logprob, reward, done, value, next_value, mask):
+    def add(self, state, action, logprob, reward, done, value, next_value, mask, terminal):
         self.states.append(state)
         self.actions.append(action)
         self.logprobs.append(logprob)
@@ -36,6 +35,7 @@ class RolloutBuffer:
         self.next_values.append(next_value)
         self.masks.append(mask)
         self.final_value = next_value
+        self.terminals.append(terminal)
 
 
 class PPO:
@@ -129,9 +129,10 @@ class PPO:
         value: float,
         next_value: float,
         legal_mask_np: np.ndarray,
+        terminal: bool | None = None,
     ):
         self.buffer.add(
-            state_np, action, logprob, reward, done, value, next_value, legal_mask_np
+            state_np, action, logprob, reward, done, value, next_value, legal_mask_np, terminal,
         )
 
     def evaluate_value(self, state_np: np.ndarray) -> float:

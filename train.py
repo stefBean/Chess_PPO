@@ -483,10 +483,10 @@ def main():
                     0.0,
                     reward,
                     done,
-                    terminal,
                     0.0,
                     0.0,
                     np.zeros(action_dim, dtype=np.float32),
+                    terminal,
                 )
                 break
 
