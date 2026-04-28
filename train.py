@@ -15,6 +15,7 @@ from board_environment import Chess
 from board_encoding import BoardEncoding
 from action_encoding import AlphaZeroActionEncoder
 from ppo import PPO
+from dopamine_pg import DopaminePolicyGradient
 from opponent_random import RandomOpponent
 from opponent_heuristic import HeuristicOpponent
 from opponent_selfplay import SelfPlayOpponent, build_action_map, OpponentPool
@@ -259,6 +260,11 @@ def build_endgame_snapshot(board, analyzer):
 
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    training_agent = os.getenv("TRAINING_AGENT", "ppo").strip().lower()
+    if training_agent not in {"ppo", "dopamine"}:
+        print(f"[WARN] Unknown TRAINING_AGENT='{training_agent}', fallback to 'ppo'.")
+        training_agent = "ppo"
+
     max_game_ply = None #240
     curriculum_stage = 0
     endgame_max_extra_per_side = 4
@@ -273,8 +279,9 @@ def main():
     # env = BoardEncoding(base_env, history_length=2)
     # Start games from random endgame positions to focus learning on
     # conversion/defense scenarios.
+    start_mode = "curriculum_endgame" if training_agent == "ppo" else "endgame"
     base_env = Chess(
-        start_mode="curriculum_endgame",
+        start_mode=start_mode,
         endgame_max_extra_per_side=endgame_max_extra_per_side,
         endgame_min_extra_total=endgame_min_extra_total,
         require_pawn=require_pawn,
@@ -292,33 +299,57 @@ def main():
     entropy_target_start = 0.75
     entropy_target_end = 0.20
 
-    agent = PPO(
-        state_dim=state_dim,
-        action_dim=action_dim,
-        actor_lr=3e-4,
-        critic_lr=1e-3,
-        gamma=0.99,
-        gae_lambda=0.95,
-        clip_eps=0.13,
-        epochs=10,
-        minibatch_size=64,
-        device=device,
-        entropy_coef=0.02,
-        value_coef=0.5,
-        max_grad_norm=0.6,
-        value_clip=0.25,
-        target_kl=0.015,
-        reward_scale=0.85,
-        reward_clip=2.5,
-        entropy_target=entropy_target_start,
-        entropy_coef_lr=0.005,
-        entropy_coef_min=0.002,
-        entropy_coef_max=0.10,
-        temperature=1.0,
-        temperature_lr=0.01,
-        temperature_min=0.7,
-        temperature_max=1.0,
-    )
+    if training_agent == "ppo":
+        agent = PPO(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            actor_lr=3e-4,
+            critic_lr=1e-3,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_eps=0.13,
+            epochs=10,
+            minibatch_size=64,
+            device=device,
+            entropy_coef=0.02,
+            value_coef=0.5,
+            max_grad_norm=0.6,
+            value_clip=0.25,
+            target_kl=0.015,
+            reward_scale=0.85,
+            reward_clip=2.5,
+            entropy_target=entropy_target_start,
+            entropy_coef_lr=0.005,
+            entropy_coef_min=0.002,
+            entropy_coef_max=0.10,
+            temperature=1.0,
+            temperature_lr=0.01,
+            temperature_min=0.7,
+            temperature_max=1.0,
+        )
+    else:
+        agent = DopaminePolicyGradient(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            actor_lr=3e-4,
+            critic_lr=1e-3,
+            gamma=0.99,
+            lam=0.95,
+            epochs=6,
+            minibatch_size=128,
+            device=device,
+            entropy_coef=0.01,
+            value_coef=0.5,
+            max_grad_norm=0.6,
+            reward_scale=0.85,
+            reward_clip=2.5,
+            temperature=1.0,
+            temperature_min=0.7,
+            temperature_max=1.2,
+            mood_mean=1.0,
+            mood_std=0.3,
+            mood_smoothing=0.3,
+        )
 
     #agent.load("models/ppo_chess")
     #opponent = RandomOpponent()
@@ -339,7 +370,8 @@ def main():
 
 
     #run_name = f"{opponent.__class__.__name__}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
-    agent.load("models/ppo_chess", strict=False)
+    model_prefix = "models/ppo_chess" if training_agent == "ppo" else "models/dopamine_chess"
+    agent.load(model_prefix, strict=False)
 
     # Choose how the agent learns: against a static opponent or via self-play.
     use_self_play = True
@@ -359,7 +391,7 @@ def main():
     opponent_pool.add(agent.actor)
     update_count = 0
     snapshot_every = 10
-    opponent_name = "SelfPlay" #if use_self_play else opponent.__class__.__name__
+    opponent_name = f"SelfPlay_{training_agent}" #if use_self_play else opponent.__class__.__name__
     run_name = f"{opponent_name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
     log_dir = f"runs/{run_name}"
     os.makedirs(log_dir, exist_ok=True)
@@ -374,6 +406,8 @@ def main():
         "learning_rate_critic": 1e-3,
         "batch_size": 384,
         "epochs_per_update": 5,
+        "training_agent": training_agent,
+        "start_mode": start_mode,
         "opponent": opponent_name,
         "steps_per_update": steps_per_update,
         "entropy_coef_init": agent.entropy_coef,
@@ -655,7 +689,7 @@ def main():
             board = base_env._board
 
             if timestep % steps_per_update == 0:
-                print(f"\nPPO UPDATE @ timestep {timestep}, episode {episode}")
+                print(f"\n{training_agent.upper()} UPDATE @ timestep {timestep}, episode {episode}")
                 progress = min(1.0, timestep / max_timesteps)
                 agent.entropy_target = entropy_target_start + (entropy_target_end - entropy_target_start) * progress
 
@@ -664,7 +698,7 @@ def main():
 
                 update_count += 1
 
-                if update_count % snapshot_every == 0:
+                if training_agent == "ppo" and update_count % snapshot_every == 0:
                     gate_score = quick_eval_gate(
                         agent.actor,
                         encoder,
@@ -731,6 +765,10 @@ def main():
                 writer.add_scalar("Policy/entropy_schedule_progress", progress, timestep)
                 writer.add_scalar("Policy/entropy_schedule_progress", progress, timestep)
                 writer.add_scalar("Policy/temperature", metrics["temperature"], timestep)
+                if "mood_mean" in metrics:
+                    writer.add_scalar("Dopamine/mood_mean", metrics["mood_mean"], timestep)
+                if "mood_scale_mean" in metrics:
+                    writer.add_scalar("Dopamine/mood_scale_mean", metrics["mood_scale_mean"], timestep)
                 writer.add_scalar("Optimization/minibatches", metrics["updates_run"], timestep)
                 writer.add_scalar("Timesteps/timestep", timestep, timestep)
                 writer.flush()
@@ -819,7 +857,7 @@ def main():
         }
     )
     writer.close()
-    agent.save("models/ppo_chess")
+    agent.save(model_prefix)
 
 
 if __name__ == "__main__":
