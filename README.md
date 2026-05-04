@@ -546,3 +546,17 @@ Probable future adaption in order to enhance the “decision making quantificati
 - Adaptive entropy/temperature: end of `ppo.py:update()`
 - Actor/Critic architectures: `actor.py`, `critic.py`
 ```
+---
+
+# New Chapter BA 2 Dopamine based agent added
+
+Now added two agents training can be set with 
+```bash
+TRAINING_AGENT=dopamine python train.py
+```
+The dopamine agent can push logits into more extreme values faster, so this pattern becomes unsafe:
+```
+masked_logits = logits.masked_fill(legal_mask == 0, -1e9)
+dist = Categorical(logits=masked_logits)
+action = dist.sample()
+```

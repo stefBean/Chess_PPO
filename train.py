@@ -356,7 +356,7 @@ def main():
     # opponent = HeuristicOpponent()
     opponent_pool = OpponentPool(max_size=8, p_latest=0.7, seed=0)
     fixed_opponents = [("random", RandomOpponent()), ("heuristic", HeuristicOpponent())]
-    fixed_opponent_prob = 0.25
+    fixed_opponent_prob = 0.0 #0.25
     max_timesteps = 400000 #200000 #500
     steps_per_update = 6144 #4096 #256 #
     timestep = 0
@@ -488,24 +488,8 @@ def main():
             # ----------------------------------------
             # BUILD LEGAL MOVES + INDEX MAP
             # ----------------------------------------
-            legal_moves = list(board.legal_moves)
-            idxs = []
-            idx_to_move = {}
 
-            for mv in legal_moves:
-                # Enforce promotion legality
-                if move_requires_promotion(board, mv) and mv.promotion is None:
-                    # Skip illegal non-promotion pawn move
-                    continue
-
-                try:
-                    idx = encoder.encode(mv, board)
-                    idxs.append(idx)
-                    idx_to_move[idx] = mv
-                except:
-                    continue
-
-            # idxs, idx_to_move = build_action_map(board, encoder)
+            idxs, idx_to_move = build_action_map(board, encoder)
 
             if not idxs:
                 reward = -1.0
@@ -540,10 +524,12 @@ def main():
                 )
             move = idx_to_move.get(action_id)
             if move is None:
-                raise RuntimeError(
-                    f"Action id {action_id} not in idx_to_move (mask/encoding mismatch). "
-                    f"Legal idx count={len(idxs)} fen={board.fen()}"
-                )
+                print("Sampled action:", action_id)
+                print("Mask legal ids:", np.where(legal_mask_np > 0)[0].tolist())
+                print("idx_to_move keys:", list(idx_to_move.keys()))
+                print("Legal moves:", [m.uci() for m in board.legal_moves])
+                print("FEN:", board.fen())
+                raise RuntimeError("Action sampled outside legal action map")
 
 
             # Final safety check

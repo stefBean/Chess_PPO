@@ -120,7 +120,19 @@ class DopaminePolicyGradient:
             masked_logits = logits.masked_fill(legal_mask == 0, -1e9)
             dist = Categorical(logits=masked_logits)
             action = dist.sample()
-            logprob = dist.log_prob(action)
+            legal_ids = torch.nonzero(legal_mask[0] > 0, as_tuple=False).squeeze(-1)
+
+            if legal_ids.numel() == 0:
+                raise RuntimeError("No legal actions available for DopaminePolicyGradient")
+
+            legal_logits = logits[0, legal_ids]
+            legal_logits = torch.nan_to_num(legal_logits, nan=0.0, posinf=1e4, neginf=-1e4)
+
+            legal_dist = Categorical(logits=legal_logits)
+            sampled_offset = legal_dist.sample()
+
+            action = legal_ids[sampled_offset]
+            logprob = legal_dist.log_prob(sampled_offset)
             value = self.critic(state).squeeze(-1)
         return int(action.item()), float(logprob.item()), float(value.item())
 

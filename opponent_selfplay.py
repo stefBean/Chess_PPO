@@ -12,7 +12,7 @@ from action_encoding import AlphaZeroActionEncoder
 
 
 class SelfPlayOpponent:
-    """A frozen copy of the current PPO policy used for self-play.
+    """A frozen copy of the current agent policy used for self-play.
 
     The opponent's actor weights are periodically refreshed from the learning
     agent to provide a moving target while keeping the opponent stable between
