@@ -8,6 +8,7 @@ import time
 import random
 import json
 import os
+import shutil
 import sys
 import threading
 
@@ -258,9 +259,52 @@ def build_endgame_snapshot(board, analyzer):
         "endgame_reason": analysis.endgame_reason,
     }
 
+
+
+def resolve_dopamine_model_prefix() -> str:
+    """Resolve an explicit dopamine checkpoint namespace for independent agents."""
+    dopamine_agent_id = os.getenv("DOPAMINE_AGENT_ID", "default").strip()
+    if not dopamine_agent_id:
+        dopamine_agent_id = "default"
+
+    model_prefix = f"models/dopamine_{dopamine_agent_id}"
+    copy_from_id = os.getenv("DOPAMINE_COPY_FROM_ID", "").strip()
+    if copy_from_id:
+        source_prefix = f"models/dopamine_{copy_from_id}"
+        ensure_agent_checkpoint_copy(source_prefix, model_prefix)
+
+    return model_prefix
+
+
+def ensure_agent_checkpoint_copy(source_prefix: str, target_prefix: str):
+    """Create an explicit copy of a trained agent checkpoint pair if needed."""
+    if source_prefix == target_prefix:
+        return
+
+    source_actor = f"{source_prefix}_actor.pt"
+    source_critic = f"{source_prefix}_critic.pt"
+    target_actor = f"{target_prefix}_actor.pt"
+    target_critic = f"{target_prefix}_critic.pt"
+
+    if not (os.path.exists(source_actor) and os.path.exists(source_critic)):
+        print(f"[WARN] Source checkpoint missing: {source_prefix}_*.pt")
+        return
+
+    os.makedirs(os.path.dirname(target_prefix), exist_ok=True)
+    if os.path.exists(target_actor) and os.path.exists(target_critic):
+        return
+
+    shutil.copy2(source_actor, target_actor)
+    shutil.copy2(source_critic, target_critic)
+    print(f"[INFO] Copied checkpoint from {source_prefix}_*.pt to {target_prefix}_*.pt")
+
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     training_agent = os.getenv("TRAINING_AGENT", "ppo").strip().lower()
+    dopamine_opponent_mode = os.getenv("DOPAMINE_OPPONENT_MODE", "selfplay").strip().lower()
+    if dopamine_opponent_mode not in {"selfplay", "ppo"}:
+        print(f"[WARN] Unknown DOPAMINE_OPPONENT_MODE='{dopamine_opponent_mode}', fallback to 'selfplay'.")
+        dopamine_opponent_mode = "selfplay"
     if training_agent not in {"ppo", "dopamine"}:
         print(f"[WARN] Unknown TRAINING_AGENT='{training_agent}', fallback to 'ppo'.")
         training_agent = "ppo"
@@ -370,15 +414,36 @@ def main():
 
 
     #run_name = f"{opponent.__class__.__name__}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
-    model_prefix = "models/ppo_chess" if training_agent == "ppo" else "models/dopamine_chess"
+    if training_agent == "ppo":
+        model_prefix = "models/ppo_chess"
+        dopamine_agent_id = "ppo"
+    else:
+        model_prefix = resolve_dopamine_model_prefix()
+        dopamine_agent_id = os.path.basename(model_prefix).replace("dopamine_", "")
+
+    print(f"[INFO] Training checkpoint prefix: {model_prefix}")
     agent.load(model_prefix, strict=False)
 
     # Choose how the agent learns: against a static opponent or via self-play.
     use_self_play = True
     # opponent = RandomOpponent()
     # opponent = HeuristicOpponent()
+    opponent_actor_source = agent.actor
+    if training_agent == "dopamine" and dopamine_opponent_mode == "ppo":
+        ppo_reference = PPO(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            device=device,
+        )
+        ppo_loaded = ppo_reference.load("models/ppo_chess", strict=False)
+        if ppo_loaded:
+            opponent_actor_source = ppo_reference.actor
+            print("[INFO] Dopamine opponent source set to PPO checkpoint models/ppo_chess_*.pt")
+        else:
+            print("[WARN] PPO checkpoint unavailable, fallback to dopamine self-play opponent snapshots.")
+
     self_play_opponent = SelfPlayOpponent(
-        agent_actor=agent.actor,
+        agent_actor=opponent_actor_source,
         encoder=encoder,
         flatten_obs=flatten_obs,
         device=agent.device,
@@ -388,10 +453,19 @@ def main():
         temperature=agent.temperature,
     )
 
-    opponent_pool.add(agent.actor)
+    if training_agent == "dopamine" and dopamine_opponent_mode == "ppo":
+        opponent_pool.add(opponent_actor_source)
+    else:
+        opponent_pool.add(agent.actor)
     update_count = 0
     snapshot_every = 10
-    opponent_name = f"SelfPlay_{training_agent}" #if use_self_play else opponent.__class__.__name__
+    if training_agent == "dopamine" and dopamine_opponent_mode == "ppo":
+        opponent_name = "PPO_reference"
+    else:
+        opponent_name = f"SelfPlay_{training_agent}"
+
+    if training_agent == "dopamine":
+        opponent_name = f"{opponent_name}_agent_{dopamine_agent_id}"
     run_name = f"{opponent_name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
     log_dir = f"runs/{run_name}"
     os.makedirs(log_dir, exist_ok=True)
@@ -407,6 +481,8 @@ def main():
         "batch_size": 384,
         "epochs_per_update": 5,
         "training_agent": training_agent,
+        "dopamine_agent_id": dopamine_agent_id,
+        "dopamine_opponent_mode": dopamine_opponent_mode,
         "start_mode": start_mode,
         "opponent": opponent_name,
         "steps_per_update": steps_per_update,
