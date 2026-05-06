@@ -20,6 +20,8 @@ class DopamineRolloutBuffer:
         self.next_values = []
         self.masks = []
         self.terminals = []
+        self.td_errors = []
+        self.dopamine_deltas = []
         self.mood_scales = []
 
     def clear(self):
@@ -36,6 +38,7 @@ class DopamineRolloutBuffer:
         next_value,
         mask,
         terminal,
+        td_error,
         mood_scale,
     ):
         self.states.append(state)
@@ -47,11 +50,13 @@ class DopamineRolloutBuffer:
         self.next_values.append(next_value)
         self.masks.append(mask)
         self.terminals.append(terminal)
+        self.td_errors.append(td_error)
+        self.dopamine_deltas.append(td_error)
         self.mood_scales.append(mood_scale)
 
 
 class DopaminePolicyGradient:
-    """Non-PPO agent with mood-modulated rewards (dopamine-inspired)."""
+    """TD-error actor-critic agent using dopamine-inspired reward prediction error."""
 
     def __init__(
         self,
@@ -67,13 +72,14 @@ class DopaminePolicyGradient:
         value_coef: float = 0.5,
         max_grad_norm: float = 0.6,
         reward_scale: float = 1.0,
-        reward_clip: float | None = 2.5,
+        reward_clip: float | None = None,
         temperature: float = 1.0,
         temperature_min: float = 0.7,
         temperature_max: float = 1.3,
         mood_mean: float = 1.0,
-        mood_std: float = 0.3,
+        mood_std: float = 0.0,
         mood_smoothing: float = 0.2,
+        use_mood_modulation: bool = False,
         device: str = "cpu",
     ):
         self.device = torch.device(device)
@@ -93,6 +99,7 @@ class DopaminePolicyGradient:
         self.mood_mean = mood_mean
         self.mood_std = mood_std
         self.mood_smoothing = mood_smoothing
+        self.use_mood_modulation = use_mood_modulation
         self.current_mood = mood_mean
         self.entropy_target = 0.0
         self.entropy_coef_min = entropy_coef
@@ -105,6 +112,9 @@ class DopaminePolicyGradient:
         self.buffer = DopamineRolloutBuffer()
 
     def _sample_mood_scale(self) -> float:
+        if not self.use_mood_modulation:
+            self.current_mood = self.mood_mean
+            return 1.0
         instant = float(np.random.normal(loc=self.mood_mean, scale=self.mood_std))
         self.current_mood = (
             (1.0 - self.mood_smoothing) * self.current_mood
@@ -117,9 +127,6 @@ class DopaminePolicyGradient:
         legal_mask = torch.from_numpy(legal_mask_np).to(self.device).unsqueeze(0)
         with torch.no_grad():
             logits = self.actor(state) / max(self.temperature, 1e-6)
-            masked_logits = logits.masked_fill(legal_mask == 0, -1e9)
-            dist = Categorical(logits=masked_logits)
-            action = dist.sample()
             legal_ids = torch.nonzero(legal_mask[0] > 0, as_tuple=False).squeeze(-1)
 
             if legal_ids.numel() == 0:
@@ -127,12 +134,10 @@ class DopaminePolicyGradient:
 
             legal_logits = logits[0, legal_ids]
             legal_logits = torch.nan_to_num(legal_logits, nan=0.0, posinf=1e4, neginf=-1e4)
-
-            legal_dist = Categorical(logits=legal_logits)
-            sampled_offset = legal_dist.sample()
-
+            dist = Categorical(logits=legal_logits)
+            sampled_offset = dist.sample()
             action = legal_ids[sampled_offset]
-            logprob = legal_dist.log_prob(sampled_offset)
+            logprob = dist.log_prob(sampled_offset)
             value = self.critic(state).squeeze(-1)
         return int(action.item()), float(logprob.item()), float(value.item())
 
@@ -154,39 +159,57 @@ class DopaminePolicyGradient:
         legal_mask_np: np.ndarray,
         terminal: bool | None = None,
     ):
+        reward_signal = float(reward) * self.reward_scale
+        if self.reward_clip is not None:
+            reward_signal = float(np.clip(reward_signal, -self.reward_clip, self.reward_clip))
+        done_float = 1.0 if done else 0.0
+        td_error = reward_signal + self.gamma * float(next_value) * (1.0 - done_float) - float(value)
         mood_scale = self._sample_mood_scale()
-        adjusted_reward = reward * mood_scale
         self.buffer.add(
             state_np,
             action,
             logprob,
-            adjusted_reward,
+            reward_signal,
             done,
             value,
             next_value,
             legal_mask_np,
             terminal,
+            td_error,
             mood_scale,
         )
 
-    def _compute_gae(self, rewards, dones, values, next_values):
-        rewards_t = torch.tensor(rewards, dtype=torch.float32, device=self.device)
-        rewards_t = rewards_t * self.reward_scale
-        if self.reward_clip is not None:
-            rewards_t = torch.clamp(rewards_t, -self.reward_clip, self.reward_clip)
+    def _compute_td_lambda_advantages(self, td_errors, dones):
+        deltas_t = torch.tensor(td_errors, dtype=torch.float32, device=self.device)
         dones_t = torch.tensor(dones, dtype=torch.float32, device=self.device)
-        values_t = torch.tensor(values, dtype=torch.float32, device=self.device)
-        next_values_t = torch.tensor(next_values, dtype=torch.float32, device=self.device)
-
-        advantages = torch.zeros_like(rewards_t)
-        gae = 0.0
-        for t in reversed(range(len(rewards_t))):
+        advantages = torch.zeros_like(deltas_t)
+        gae = torch.tensor(0.0, dtype=torch.float32, device=self.device)
+        for t in reversed(range(len(deltas_t))):
             mask = 1.0 - dones_t[t]
-            delta = rewards_t[t] + self.gamma * next_values_t[t] * mask - values_t[t]
-            gae = delta + self.gamma * self.lam * mask * gae
+            gae = deltas_t[t] + self.gamma * self.lam * mask * gae
             advantages[t] = gae
-        returns = advantages + values_t
-        return advantages, returns
+        return advantages
+
+    def _evaluate_legal_batch(self, states, actions, masks):
+        logits = self.actor(states) / max(self.temperature, 1e-6)
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
+        logprobs = []
+        entropies = []
+        for i in range(states.size(0)):
+            legal_ids = torch.nonzero(masks[i] > 0, as_tuple=False).squeeze(-1)
+            if legal_ids.numel() == 0:
+                raise RuntimeError("Transition has no legal actions in DopaminePolicyGradient.update")
+            legal_logits = logits[i, legal_ids]
+            dist = Categorical(logits=legal_logits)
+            matches = torch.nonzero(legal_ids == actions[i], as_tuple=False).squeeze(-1)
+            if matches.numel() == 0:
+                raise RuntimeError(
+                    f"Stored action {int(actions[i].item())} is outside its legal mask; "
+                    f"legal ids={legal_ids.detach().cpu().tolist()}"
+                )
+            logprobs.append(dist.log_prob(matches[0]))
+            entropies.append(dist.entropy())
+        return torch.stack(logprobs), torch.stack(entropies)
 
     def update(self):
         if not self.buffer.states:
@@ -207,25 +230,39 @@ class DopaminePolicyGradient:
                 "action_value_gap": 0.0,
                 "temperature": self.temperature,
                 "updates_run": 0,
+                "td_error_mean": 0.0,
+                "td_error_abs_mean": 0.0,
+                "td_error_std": 0.0,
+                "td_error_positive_rate": 0.0,
+                "td_lambda_adv_mean": 0.0,
+                "td_lambda_adv_std": 0.0,
+                "actor_signal_mean": 0.0,
+                "actor_signal_std": 0.0,
+                "legal_entropy": 0.0,
                 "mood_mean": self.current_mood,
                 "mood_scale_mean": 1.0,
+                "use_mood_modulation": self.use_mood_modulation,
             }
 
         states = torch.tensor(np.array(self.buffer.states), dtype=torch.float32, device=self.device)
         actions = torch.tensor(self.buffer.actions, dtype=torch.long, device=self.device)
-        old_logprobs = torch.tensor(self.buffer.logprobs, dtype=torch.float32, device=self.device)
         masks = torch.tensor(np.array(self.buffer.masks), dtype=torch.float32, device=self.device)
-        values = np.array(self.buffer.values, dtype=np.float32)
-        next_values = np.array(self.buffer.next_values, dtype=np.float32)
-        rewards = np.array(self.buffer.rewards, dtype=np.float32)
-        dones = np.array(self.buffer.dones, dtype=np.float32)
+        rewards = torch.tensor(self.buffer.rewards, dtype=torch.float32, device=self.device)
+        dones = torch.tensor(self.buffer.dones, dtype=torch.float32, device=self.device)
+        next_values = torch.tensor(self.buffer.next_values, dtype=torch.float32, device=self.device)
+        td_errors = np.array(self.buffer.td_errors, dtype=np.float32)
+        td_errors_t = torch.tensor(td_errors, dtype=torch.float32, device=self.device)
 
-        advantages_raw, returns = self._compute_gae(rewards, dones, values, next_values)
-        advantages = (advantages_raw - advantages_raw.mean()) / (advantages_raw.std() + 1e-8)
+        critic_targets = rewards + self.gamma * next_values * (1.0 - dones)
+        td_lambda_adv = self._compute_td_lambda_advantages(td_errors, self.buffer.dones)
+        dopamine_adv = (td_lambda_adv - td_lambda_adv.mean()) / (td_lambda_adv.std(unbiased=False) + 1e-8)
+
+        mood_scales_t = torch.tensor(self.buffer.mood_scales, dtype=torch.float32, device=self.device)
+        actor_signal = dopamine_adv * mood_scales_t if self.use_mood_modulation else dopamine_adv
 
         n = states.size(0)
         indices = np.arange(n)
-        actor_losses, critic_losses, entropies, approx_kls = [], [], [], []
+        actor_losses, critic_losses, entropies = [], [], []
         updates_run = 0
 
         for _ in range(self.epochs):
@@ -234,22 +271,17 @@ class DopaminePolicyGradient:
                 mb = indices[start:start + self.minibatch_size]
                 mb_states = states[mb]
                 mb_actions = actions[mb]
-                mb_adv = advantages[mb]
-                mb_returns = returns[mb]
+                mb_actor_signal = actor_signal[mb]
+                mb_targets = critic_targets[mb]
                 mb_masks = masks[mb]
-                mb_old_logprobs = old_logprobs[mb]
 
-                logits = self.actor(mb_states) / max(self.temperature, 1e-6)
-                masked_logits = logits.masked_fill(mb_masks == 0, -1e9)
-                dist = Categorical(logits=masked_logits)
-                new_logprobs = dist.log_prob(mb_actions)
-                entropy = dist.entropy().mean()
-
-                policy_loss = -(new_logprobs * mb_adv.detach()).mean()
+                new_logprobs, entropy_values = self._evaluate_legal_batch(mb_states, mb_actions, mb_masks)
+                entropy = entropy_values.mean()
+                policy_loss = -(new_logprobs * mb_actor_signal.detach()).mean()
                 actor_loss = policy_loss - self.entropy_coef * entropy
 
                 values_pred = self.critic(mb_states).squeeze(-1)
-                critic_loss = F.mse_loss(values_pred, mb_returns.detach())
+                critic_loss = F.mse_loss(values_pred, mb_targets.detach())
 
                 self.optim_actor.zero_grad()
                 actor_loss.backward()
@@ -261,8 +293,6 @@ class DopaminePolicyGradient:
                 torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
                 self.optim_critic.step()
 
-                approx_kl = (mb_old_logprobs - new_logprobs).mean().item()
-                approx_kls.append(float(approx_kl))
                 actor_losses.append(float(actor_loss.item()))
                 critic_losses.append(float(critic_loss.item()))
                 entropies.append(float(entropy.item()))
@@ -271,37 +301,54 @@ class DopaminePolicyGradient:
         mood_scale_mean = float(np.mean(self.buffer.mood_scales)) if self.buffer.mood_scales else float(self.current_mood)
         self.buffer.clear()
         entropy_mean = float(np.mean(entropies)) if entropies else 0.0
-        normalized_entropy = entropy_mean / np.log(masks.shape[1])
+        legal_counts = masks.sum(dim=1).clamp_min(2.0)
+        normalized_entropy = float((entropy_mean / torch.log(legal_counts).mean()).item()) if n else 0.0
         return {
             "actor_loss": float(np.mean(actor_losses)) if actor_losses else 0.0,
             "critic_loss": float(np.mean(critic_losses)) if critic_losses else 0.0,
             "entropy": entropy_mean,
-            "normalized_entropy": float(normalized_entropy),
+            "normalized_entropy": normalized_entropy,
             "entropy_coef": self.entropy_coef,
-            "approx_kl": float(np.mean(approx_kls)) if approx_kls else 0.0,
-            "policy_shift_kl": float(np.mean(approx_kls)) if approx_kls else 0.0,
-            "policy_update_kl": float(np.mean(approx_kls)) if approx_kls else 0.0,
-            "advantages_raw_mean": float(advantages_raw.mean().item()),
-            "advantages_raw_std": float(advantages_raw.std().item()),
-            "advantages_norm_mean": float(advantages.mean().item()),
-            "advantages_norm_std": float(advantages.std().item()),
-            "expected_advantage": float(advantages_raw.mean().item()),
+            "approx_kl": 0.0,
+            "policy_shift_kl": 0.0,
+            "policy_update_kl": 0.0,
+            "advantages_raw_mean": float(td_lambda_adv.mean().item()),
+            "advantages_raw_std": float(td_lambda_adv.std(unbiased=False).item()),
+            "advantages_norm_mean": float(dopamine_adv.mean().item()),
+            "advantages_norm_std": float(dopamine_adv.std().item()),
+            "expected_advantage": float(td_errors_t.mean().item()),
             "action_value_gap": 0.0,
             "temperature": self.temperature,
             "updates_run": updates_run,
+            "td_error_mean": float(td_errors_t.mean().item()),
+            "td_error_abs_mean": float(td_errors_t.abs().mean().item()),
+            "td_error_std": float(td_errors_t.std(unbiased=False).item()),
+            "td_error_positive_rate": float((td_errors_t > 0).float().mean().item()),
+            "td_lambda_adv_mean": float(td_lambda_adv.mean().item()),
+            "td_lambda_adv_std": float(td_lambda_adv.std(unbiased=False).item()),
+            "actor_signal_mean": float(actor_signal.mean().item()),
+            "actor_signal_std": float(actor_signal.std(unbiased=False).item()),
+            "legal_entropy": entropy_mean,
             "mood_mean": float(self.current_mood),
             "mood_scale_mean": mood_scale_mean,
+            "use_mood_modulation": self.use_mood_modulation,
         }
 
     def save(self, path_prefix: str):
-        os.makedirs(os.path.dirname(path_prefix), exist_ok=True)
+        directory = os.path.dirname(path_prefix)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
         torch.save(self.actor.state_dict(), f"{path_prefix}_actor.pt")
         torch.save(self.critic.state_dict(), f"{path_prefix}_critic.pt")
 
     def load(self, path_prefix: str, strict: bool = True):
         actor_path = f"{path_prefix}_actor.pt"
         critic_path = f"{path_prefix}_critic.pt"
-        if os.path.exists(actor_path):
-            self.actor.load_state_dict(torch.load(actor_path, map_location=self.device), strict=strict)
-        if os.path.exists(critic_path):
-            self.critic.load_state_dict(torch.load(critic_path, map_location=self.device), strict=strict)
+        if not (os.path.exists(actor_path) and os.path.exists(critic_path)):
+            print(f"[WARN] No saved actor/critic checkpoint found at: {path_prefix}_*.pt")
+            return False
+        self.actor.load_state_dict(torch.load(actor_path, map_location=self.device), strict=strict)
+        self.critic.load_state_dict(torch.load(critic_path, map_location=self.device), strict=strict)
+        print(f"[INFO] Loaded dopamine actor from  {actor_path}")
+        print(f"[INFO] Loaded dopamine critic from {critic_path}")
+        return True
