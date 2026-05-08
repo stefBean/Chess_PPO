@@ -63,7 +63,7 @@ class DopaminePolicyGradient:
         lam: float = 0.95,
         epochs: int = 4,
         minibatch_size: int = 128,
-        entropy_coef: float = 0.01,
+        entropy_coef: float = 0.03,
         value_coef: float = 0.5,
         max_grad_norm: float = 0.6,
         reward_scale: float = 1.0,
@@ -72,7 +72,7 @@ class DopaminePolicyGradient:
         temperature_min: float = 0.7,
         temperature_max: float = 1.3,
         mood_mean: float = 1.0,
-        mood_std: float = 0.3,
+        mood_std: float = 0.5,
         mood_smoothing: float = 0.2,
         device: str = "cpu",
     ):
