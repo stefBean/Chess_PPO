@@ -1,23 +1,20 @@
 import copy
-from typing import Callable, Dict, List, Tuple
 import random
 from collections import deque
-from typing import Callable, Deque, Dict, List, Tuple
+from typing import Callable, Deque, Dict, Tuple
 
 import numpy as np
 import torch
 import chess
 
-from action_encoding import AlphaZeroActionEncoder
+from action_encoding import AlphaZeroActionEncoder, build_action_map
 
 
 class SelfPlayOpponent:
     """A frozen copy of the current agent policy used for self-play.
 
-    The opponent's actor weights are periodically refreshed from the learning
-    agent to provide a moving target while keeping the opponent stable between
-    refreshes. Action selection mirrors the masking logic used by the agent so
-    that only legal chess moves are sampled.
+    The opponent's actor weights are refreshed from snapshots of the current
+    agent policy. Action selection samples only from encoded legal chess moves.
     """
 
     def __init__(
@@ -85,53 +82,96 @@ class SelfPlayOpponent:
         reuse it if needed.
         """
         state_np = self.flatten_obs(observation)
-        idxs, idx_to_move = build_action_map(board, self.encoder)
+        idxs, idx_to_move, legal_mask_np = build_action_map(board, self.encoder)
 
         if not idxs:
             return None, {"legal_mask": None, "idx_to_move": idx_to_move}
-
-        legal_mask_np = np.zeros(self.encoder.ACT_DIM, dtype=np.float32)
-        legal_mask_np[idxs] = 1.0
 
         state = torch.from_numpy(state_np).float().to(self.device).unsqueeze(0)
         legal_mask = torch.from_numpy(legal_mask_np).to(self.device).unsqueeze(0)
 
         with torch.no_grad():
-            # logits = self.actor(state)
-            logits = self.opponent_actor(state)
-            temperature = max(self.temperature, 1e-3)
-            logits = logits / temperature
-            masked_logits = logits.masked_fill(legal_mask == 0, -1e9)
-            dist = torch.distributions.Categorical(logits=masked_logits)
-            action = dist.sample()
+            logits = self.opponent_actor(state) / max(self.temperature, 1e-3)
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
+            legal_ids = torch.nonzero(legal_mask[0] > 0, as_tuple=False).squeeze(-1)
+            legal_logits = logits[0, legal_ids]
+            dist = torch.distributions.Categorical(logits=legal_logits)
+            sampled_offset = dist.sample()
+            action = legal_ids[sampled_offset]
 
-        move = idx_to_move.get(int(action.item()))
+        action_id = int(action.item())
+        move = idx_to_move.get(action_id)
         if move is None:
-            legal_moves = list(board.legal_moves)
-            move = np.random.choice(legal_moves)
+            raise RuntimeError(
+                "Self-play opponent sampled action without a move mapping; "
+                f"sampled_action_id={action_id}; "
+                f"legal_ids={idxs}; "
+                f"fen={board.fen()}; "
+                f"legal_uci_moves={[m.uci() for m in board.legal_moves]}"
+            )
 
-        # self.steps_since_refresh += 1
         return move, {"legal_mask": legal_mask_np, "idx_to_move": idx_to_move}
 
 
-def build_action_map(
-    board: chess.Board, encoder: AlphaZeroActionEncoder
-) -> Tuple[List[int], Dict[int, chess.Move]]:
-    """Return the encoded legal action ids and mapping to chess.Move objects."""
-    legal_moves = list(board.legal_moves)
-    idxs: List[int] = []
-    idx_to_move: Dict[int, chess.Move] = {}
+class FrozenPolicyOpponent:
+    """Inference-only policy opponent with legal-id-only action sampling."""
 
-    for mv in legal_moves:
-        try:
-            idx = encoder.encode(mv, board)
-            idxs.append(idx)
-            idx_to_move[idx] = mv
-        except Exception:
-            continue
-    return idxs, idx_to_move
+    def __init__(
+        self,
+        actor: torch.nn.Module,
+        encoder: AlphaZeroActionEncoder,
+        flatten_obs: Callable[[np.ndarray], np.ndarray],
+        device: torch.device,
+        temperature: float = 1.0,
+        deterministic: bool = False,
+    ) -> None:
+        self.encoder = encoder
+        self.flatten_obs = flatten_obs
+        self.device = device
+        self.temperature = temperature
+        self.deterministic = deterministic
+        self.actor = copy.deepcopy(actor).to(self.device)
+        self.actor.eval()
+        for param in self.actor.parameters():
+            param.requires_grad_(False)
 
-# load snapshot and adding a pool class
+    def select_move(
+        self, board: chess.Board, observation: np.ndarray
+    ) -> Tuple[chess.Move, Dict[str, np.ndarray]]:
+        state_np = self.flatten_obs(observation)
+        idxs, idx_to_move, legal_mask_np = build_action_map(board, self.encoder)
+        if not idxs:
+            return None, {"legal_mask": None, "idx_to_move": idx_to_move}
+
+        state = torch.from_numpy(state_np).float().to(self.device).unsqueeze(0)
+        legal_mask = torch.from_numpy(legal_mask_np).to(self.device).unsqueeze(0)
+
+        with torch.no_grad():
+            logits = self.actor(state) / max(self.temperature, 1e-6)
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
+            legal_ids = torch.nonzero(legal_mask[0] > 0, as_tuple=False).squeeze(-1)
+            legal_logits = logits[0, legal_ids]
+            if self.deterministic:
+                sampled_offset = torch.argmax(legal_logits)
+            else:
+                dist = torch.distributions.Categorical(logits=legal_logits)
+                sampled_offset = dist.sample()
+            action = legal_ids[sampled_offset]
+
+        action_id = int(action.item())
+        move = idx_to_move.get(action_id)
+        if move is None:
+            raise RuntimeError(
+                "Frozen policy opponent sampled action without a move mapping; "
+                f"sampled_action_id={action_id}; "
+                f"legal_ids={idxs}; "
+                f"fen={board.fen()}; "
+                f"legal_uci_moves={[m.uci() for m in board.legal_moves]}"
+            )
+        return move, {"legal_mask": legal_mask_np, "idx_to_move": idx_to_move}
+
+
+# Snapshot pool for current agent policies.
 class OpponentPool:
     def __init__(self, max_size: int = 8, p_latest: float = 0.7, seed: int = 0):
         self.max_size = max_size
