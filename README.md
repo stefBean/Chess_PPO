@@ -528,9 +528,8 @@ Probable future adaption in order to enhance the “decision making quantificati
 3. **Update game complexity**
    - update the `boad_environment.py`, `board_encoding.py` and `reward_shaping.py` to highten the game complexity for a stronger agent
 
-4. **Dopamine based agent**
-   - generate a new independent dopamine based agent to train within the same environment, without PPO
-   - play against PPO agent to compare outcome of training values, decision process, quantifiable metrics.
+4. **Dopamine comparison analysis**
+   - use the implemented dopamine TD-error agents and deterministic evaluation suite below to compare self-play training against frozen-PPO-opponent training.
 ---
 
 
@@ -545,18 +544,292 @@ Probable future adaption in order to enhance the “decision making quantificati
 - KL early stopping: `ppo.py:update()` after `approx_kl` computation
 - Adaptive entropy/temperature: end of `ppo.py:update()`
 - Actor/Critic architectures: `actor.py`, `critic.py`
+- Dopamine TD-error learner: `dopamine_pg.py`
+- Legal action map shared by agents/opponents: `action_encoding.py:build_action_map()`
+- Self-play and frozen policy opponents: `opponent_selfplay.py`
+- Deterministic dopamine comparison: `evaluate_dopamine.py`
 ```
 ---
 
-# New Chapter BA 2 Dopamine based agent added
+# New Chapter BA 2: Dopamine-inspired TD-error agent system
 
-Now added two agents training can be set with 
+The repository now supports a thesis comparison between PPO and two dopamine-inspired actor-critic agents. The dopamine agent is **not PPO-like**: it learns from an explicit temporal-difference reward-prediction error (RPE) signal:
+
+```text
+delta_t = r_t + gamma * V(s_{t+1}) * (1 - done_t) - V(s_t)
+```
+
+This signal is stored as `td_error` / `dopamine_delta` and is directly logged for analysis. Mood modulation is optional and secondary only; by default it is disabled (`use_mood_modulation=False`, `mood_mean=1.0`, `mood_std=0.0`).
+
+## 14.1 Experiment modes
+
+Training is now selected with `TRAINING_MODE`, not only by `TRAINING_AGENT`:
+
 ```bash
-TRAINING_AGENT=dopamine python train.py
+TRAINING_MODE=ppo python train.py
+TRAINING_MODE=dopamine_self python train.py
+TRAINING_MODE=dopamine_vs_ppo python train.py
 ```
-The dopamine agent can push logits into more extreme values faster, so this pattern becomes unsafe:
+
+Supported modes:
+
+| Mode | Learning agent | Opponent regime | Checkpoint prefix | TensorBoard run prefix |
+| --- | --- | --- | --- | --- |
+| `ppo` | PPO | PPO/current-policy self-play snapshots | `models/ppo_chess` | `PPO_<timestamp>` |
+| `dopamine_self` | Dopamine TD-error actor-critic | Dopamine self-play snapshots only | `models/dopamine_self_chess` | `DopamineSelf_<timestamp>` |
+| `dopamine_vs_ppo` | Dopamine TD-error actor-critic | Frozen PPO actor loaded from `models/ppo_chess` | `models/dopamine_vs_ppo_chess` | `DopamineVsPPO_<timestamp>` |
+
+The two dopamine modes are intended to differ only by opponent regime:
+
+```text
+dopamine_self   -> opponent = own dopamine self-play snapshots
+dopamine_vs_ppo -> opponent = frozen PPO policy
 ```
-masked_logits = logits.masked_fill(legal_mask == 0, -1e9)
-dist = Categorical(logits=masked_logits)
-action = dist.sample()
+
+All other settings should be kept equal for thesis comparison: architecture, learning rates, `gamma`, `lambda`, reward shaping, start positions, max timesteps, seeds, and evaluation suite.
+
+## 14.2 Dopamine learner details
+
+`dopamine_pg.py` exposes the same training-loop API as before:
+
+```text
+select_action(state_np, legal_mask_np)
+evaluate_value(state_np)
+store_transition(...)
+update()
+save(path_prefix)
+load(path_prefix, strict=False)
 ```
+
+For every transition, the rollout buffer stores:
+
+```text
+state, action, logprob, reward, done, value, next_value,
+legal_mask, td_error / dopamine_delta, mood_scale
+```
+
+The critic target is one-step TD:
+
+```text
+V_target = r_t + gamma * V(s_{t+1}) * (1 - done_t)
+critic_loss = MSE(V(s_t), V_target)
+```
+
+The actor is updated with a dopamine/RPE signal. The implementation computes TD(λ)-style advantages from the TD-error sequence:
+
+```text
+gae_t = delta_t + gamma * lambda * (1 - done_t) * gae_{t+1}
+dopamine_adv = (gae - mean(gae)) / (std(gae) + 1e-8)
+policy_loss = -logπ(a_t | s_t) * dopamine_adv
+```
+
+If mood modulation is explicitly enabled:
+
+```bash
+USE_MOOD_MODULATION=1 TRAINING_MODE=dopamine_self python train.py
+```
+
+then mood scales only the actor signal, not the reward or critic target:
+
+```text
+actor_signal = dopamine_adv * mood_scale
+```
+
+## 14.3 Legal-action sampling and action maps
+
+Legal action handling is centralized in `action_encoding.py`:
+
+```python
+idxs, idx_to_move, legal_mask_np = build_action_map(board, encoder)
+```
+
+`build_action_map` iterates over `board.legal_moves`, encodes each move, ignores unencodable moves, rejects ids outside `[0, encoder.ACT_DIM)`, avoids duplicate ids, and returns the mask used by agents and opponents.
+
+Dopamine action sampling no longer builds a distribution over all 4672 actions with illegal logits set to `-1e9`. Instead, it samples only among legal ids:
+
+```python
+legal_ids = torch.nonzero(legal_mask[0] > 0, as_tuple=False).squeeze(-1)
+legal_logits = logits[0, legal_ids]
+dist = Categorical(logits=legal_logits)
+sampled_offset = dist.sample()
+action = legal_ids[sampled_offset]
+```
+
+The self-play and frozen-policy opponents use the same legal-only strategy. If a sampled action cannot be mapped back to a move, the code raises a diagnostic error containing the sampled id, legal ids, FEN, and legal UCI moves.
+
+## 14.4 Frozen PPO opponent
+
+`FrozenPolicyOpponent` in `opponent_selfplay.py` is used for `TRAINING_MODE=dopamine_vs_ppo`. It:
+
+- accepts an actor, encoder, `flatten_obs`, and device;
+- deep-copies the actor;
+- switches it to `eval()` mode;
+- disables gradients with `requires_grad_(False)`;
+- chooses moves under `torch.no_grad()`;
+- samples only from legal action ids.
+
+For `dopamine_vs_ppo`, the PPO checkpoint must exist:
+
+```text
+models/ppo_chess_actor.pt
+models/ppo_chess_critic.pt
+```
+
+The PPO opponent is inference-only and its weights are never updated during dopamine training.
+
+## 14.5 Checkpoints and shared dopamine initialization
+
+Checkpoint namespaces are intentionally separate:
+
+```text
+models/ppo_chess
+models/dopamine_self_chess
+models/dopamine_vs_ppo_chess
+models/dopamine_base_chess
+```
+
+To initialize both dopamine agents from the exact same base checkpoint for fair comparison:
+
+```bash
+INIT_DOPAMINE_BASE=1 TRAINING_MODE=dopamine_self python train.py
+INIT_DOPAMINE_BASE=1 TRAINING_MODE=dopamine_vs_ppo python train.py
+```
+
+This creates or loads:
+
+```text
+models/dopamine_base_chess
+```
+
+and copies it into both dopamine experiment checkpoints:
+
+```text
+models/dopamine_self_chess
+models/dopamine_vs_ppo_chess
+```
+
+Dopamine is **not** initialized from PPO unless explicitly requested:
+
+```bash
+INIT_DOPAMINE_FROM_PPO=1 TRAINING_MODE=dopamine_self python train.py
+```
+
+When combined with `INIT_DOPAMINE_BASE=1`, the shared dopamine base is created from PPO only if `INIT_DOPAMINE_FROM_PPO=1`; otherwise the base comes from the dopamine random initialization.
+
+## 14.6 TensorBoard logging and metadata
+
+Each run logs comparison metadata in hparams:
+
+```text
+training_mode
+agent_type
+opponent_type
+checkpoint_prefix
+initialized_from
+fixed_opponent_prob
+start_mode
+seed
+```
+
+Dopamine runs additionally log explicit RPE metrics:
+
+```text
+Dopamine/td_error_mean
+Dopamine/td_error_abs_mean
+Dopamine/td_error_std
+Dopamine/td_error_positive_rate
+Dopamine/td_lambda_adv_mean
+Dopamine/td_lambda_adv_std
+Dopamine/actor_signal_mean
+Dopamine/actor_signal_std
+Dopamine/mood_scale_mean  # only when mood modulation is enabled
+Policy/legal_entropy
+Policy/temperature
+Episode/return
+Episode/length
+```
+
+These metrics make the dopamine signal directly measurable for comparison with PPO.
+
+## 14.7 Deterministic dopamine comparison evaluation
+
+Use the evaluation script after training both dopamine agents:
+
+```bash
+python evaluate_dopamine.py
+```
+
+It evaluates:
+
+```text
+models/dopamine_self_chess
+models/dopamine_vs_ppo_chess
+```
+
+against the same fixed opponent suite:
+
+```text
+random
+heuristic
+frozen_ppo
+dopamine_self_snapshot
+dopamine_vs_ppo_snapshot
+```
+
+The script uses the same number of games, random seed, start mode, max ply, and alternating agent colors for both dopamine agents. Configure it with:
+
+```bash
+SEED=0 EVAL_GAMES=20 EVAL_START_MODE=endgame EVAL_MAX_PLY=160 python evaluate_dopamine.py
+```
+
+It writes:
+
+```text
+evaluation_results/dopamine_comparison.json
+evaluation_results/dopamine_comparison.csv
+```
+
+Metrics include:
+
+```text
+win rate
+draw rate
+loss rate
+average return
+return per ply
+average game length
+mate/conversion rate
+illegal action count
+average TD error
+TD error abs mean
+policy entropy
+legal candidate count
+```
+
+## 14.8 Recommended thesis workflow
+
+1. Train or load PPO baseline:
+
+```bash
+TRAINING_MODE=ppo SEED=0 python train.py
+```
+
+2. Create a shared dopamine base and train dopamine self-play:
+
+```bash
+INIT_DOPAMINE_BASE=1 TRAINING_MODE=dopamine_self SEED=0 python train.py
+```
+
+3. Train dopamine against frozen PPO from the same dopamine base:
+
+```bash
+INIT_DOPAMINE_BASE=1 TRAINING_MODE=dopamine_vs_ppo SEED=0 python train.py
+```
+
+4. Run deterministic comparison:
+
+```bash
+SEED=0 EVAL_GAMES=20 python evaluate_dopamine.py
+```
+
+This workflow ensures the two dopamine agents differ only by opponent regime while using the same architecture, initialization policy, learning setup, and evaluation suite.

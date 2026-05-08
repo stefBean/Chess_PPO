@@ -109,7 +109,7 @@ class AlphaZeroActionEncoder:
         return chess.Move(from_sq, to_sq, promotion=promo_piece)
 
     # --------------------------------------------
-    # Legal mask for PPO
+    # Legal mask for policy learning
     # --------------------------------------------
     def legal_mask(self, board: chess.Board):
         mask = np.zeros(self.ACT_DIM, dtype=np.float32)
@@ -120,3 +120,27 @@ class AlphaZeroActionEncoder:
             except ValueError:
                 continue
         return mask
+
+
+def build_action_map(board: chess.Board, encoder: AlphaZeroActionEncoder):
+    """Return encoded legal ids, id-to-move map, and legal mask for a board."""
+    idxs = []
+    idx_to_move = {}
+    seen = set()
+    legal_mask_np = np.zeros(encoder.ACT_DIM, dtype=np.float32)
+
+    for move in board.legal_moves:
+        try:
+            idx = encoder.encode(move, board)
+        except ValueError:
+            continue
+        if idx < 0 or idx >= encoder.ACT_DIM:
+            continue
+        if idx in seen:
+            continue
+        seen.add(idx)
+        idxs.append(idx)
+        idx_to_move[idx] = move
+        legal_mask_np[idx] = 1.0
+
+    return idxs, idx_to_move, legal_mask_np

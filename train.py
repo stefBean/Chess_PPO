@@ -14,12 +14,12 @@ import threading
 
 from board_environment import Chess
 from board_encoding import BoardEncoding
-from action_encoding import AlphaZeroActionEncoder
+from action_encoding import AlphaZeroActionEncoder, build_action_map
 from ppo import PPO
 from dopamine_pg import DopaminePolicyGradient
 from opponent_random import RandomOpponent
 from opponent_heuristic import HeuristicOpponent
-from opponent_selfplay import SelfPlayOpponent, build_action_map, OpponentPool
+from opponent_selfplay import SelfPlayOpponent, FrozenPolicyOpponent, OpponentPool
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
 from inspect_board import BoardAnalyzer
@@ -75,22 +75,21 @@ def quick_eval_gate(
 
         while not done and plies < max_plies:
             state_np = flatten_obs_fn(obs)
-            idxs, idx_to_move = build_action_map(board, encoder)
+            idxs, idx_to_move, legal_mask_np = build_action_map(board, encoder)
             if not idxs:
                 total_score -= 0.5
                 break
-
-            legal_mask_np = np.zeros(encoder.ACT_DIM, dtype=np.float32)
-            legal_mask_np[idxs] = 1.0
 
             state = torch.from_numpy(state_np).float().to(device).unsqueeze(0)
             legal_mask = torch.from_numpy(legal_mask_np).to(device).unsqueeze(0)
 
             with torch.no_grad():
                 logits = actor(state) / max(temperature, 1e-6)
-                masked_logits = logits.masked_fill(legal_mask == 0, -1e9)
-                dist = torch.distributions.Categorical(logits=masked_logits)
-                action = dist.sample()
+                legal_ids = torch.nonzero(legal_mask[0] > 0, as_tuple=False).squeeze(-1)
+                legal_logits = torch.nan_to_num(logits[0, legal_ids], nan=0.0, posinf=1e4, neginf=-1e4)
+                dist = torch.distributions.Categorical(logits=legal_logits)
+                sampled_offset = dist.sample()
+                action = legal_ids[sampled_offset]
 
             move = idx_to_move.get(int(action.item()))
             if move is None:
@@ -215,14 +214,16 @@ def build_policy_metrics(agent, state_np, legal_mask_np, idx_to_move, board, top
     legal_mask = torch.from_numpy(legal_mask_np).to(agent.device).unsqueeze(0)
     with torch.no_grad():
         logits = agent.actor(state) / max(agent.temperature, 1e-6)
-        masked_logits = logits.masked_fill(legal_mask == 0, -1e9)
-        dist = torch.distributions.Categorical(logits=masked_logits)
+        legal_ids = torch.nonzero(legal_mask[0] > 0, as_tuple=False).squeeze(-1)
+        legal_logits = torch.nan_to_num(logits[0, legal_ids], nan=0.0, posinf=1e4, neginf=-1e4)
+        dist = torch.distributions.Categorical(logits=legal_logits)
         entropy = float(dist.entropy().item())
-        probs = dist.probs.squeeze(0)
+        legal_probs = dist.probs
 
     legal_count = int(legal_mask_np.sum())
     k = max(1, min(top_k, legal_count))
-    top_probs, top_indices = torch.topk(probs, k)
+    top_probs, top_offsets = torch.topk(legal_probs, k)
+    top_indices = legal_ids[top_offsets]
     top_moves = []
     for prob, idx in zip(top_probs.tolist(), top_indices.tolist()):
         move = idx_to_move.get(int(idx))
@@ -239,7 +240,7 @@ def build_policy_metrics(agent, state_np, legal_mask_np, idx_to_move, board, top
     action_value_gap = 0.0
     if legal_count >= 2:
         with torch.no_grad():
-            top2 = torch.topk(probs, k=2, dim=-1).values.squeeze(0)
+            top2 = torch.topk(legal_probs, k=2, dim=-1).values
             action_value_gap = float((top2[0] - top2[1]).item())
 
     return {
@@ -261,55 +262,86 @@ def build_endgame_snapshot(board, analyzer):
 
 
 
-def resolve_dopamine_model_prefix() -> str:
-    """Resolve an explicit dopamine checkpoint namespace for independent agents."""
-    dopamine_agent_id = os.getenv("DOPAMINE_AGENT_ID", "default").strip()
-    if not dopamine_agent_id:
-        dopamine_agent_id = "default"
-
-    model_prefix = f"models/dopamine_{dopamine_agent_id}"
-    copy_from_id = os.getenv("DOPAMINE_COPY_FROM_ID", "").strip()
-    if copy_from_id:
-        source_prefix = f"models/dopamine_{copy_from_id}"
-        ensure_agent_checkpoint_copy(source_prefix, model_prefix)
-
-    return model_prefix
+DOPAMINE_SELF_PREFIX = "models/dopamine_self_chess"
+DOPAMINE_VS_PPO_PREFIX = "models/dopamine_vs_ppo_chess"
+DOPAMINE_BASE_PREFIX = "models/dopamine_base_chess"
 
 
-def ensure_agent_checkpoint_copy(source_prefix: str, target_prefix: str):
-    """Create an explicit copy of a trained agent checkpoint pair if needed."""
-    if source_prefix == target_prefix:
-        return
+def resolve_checkpoint_prefix(training_mode: str) -> str:
+    """Resolve checkpoint namespaces for fair PPO/dopamine experiments."""
+    if training_mode == "ppo":
+        return "models/ppo_chess"
+    if training_mode == "dopamine_self":
+        return DOPAMINE_SELF_PREFIX
+    if training_mode == "dopamine_vs_ppo":
+        return DOPAMINE_VS_PPO_PREFIX
+    raise ValueError(f"Unsupported training mode: {training_mode}")
 
+
+def copy_checkpoint_pair(source_prefix: str, target_prefix: str) -> bool:
     source_actor = f"{source_prefix}_actor.pt"
     source_critic = f"{source_prefix}_critic.pt"
     target_actor = f"{target_prefix}_actor.pt"
     target_critic = f"{target_prefix}_critic.pt"
-
     if not (os.path.exists(source_actor) and os.path.exists(source_critic)):
-        print(f"[WARN] Source checkpoint missing: {source_prefix}_*.pt")
-        return
-
+        return False
     os.makedirs(os.path.dirname(target_prefix), exist_ok=True)
-    if os.path.exists(target_actor) and os.path.exists(target_critic):
-        return
-
     shutil.copy2(source_actor, target_actor)
     shutil.copy2(source_critic, target_critic)
-    print(f"[INFO] Copied checkpoint from {source_prefix}_*.pt to {target_prefix}_*.pt")
+    return True
+
+
+def initialize_dopamine_base(agent: DopaminePolicyGradient, model_prefix: str) -> str:
+    """Initialize dopamine experiment checkpoints from one shared base."""
+    base_actor = f"{DOPAMINE_BASE_PREFIX}_actor.pt"
+    base_critic = f"{DOPAMINE_BASE_PREFIX}_critic.pt"
+    initialized_from = DOPAMINE_BASE_PREFIX
+
+    if not (os.path.exists(base_actor) and os.path.exists(base_critic)):
+        if os.getenv("INIT_DOPAMINE_FROM_PPO", "0") == "1":
+            print("[INFO] Creating shared dopamine base from models/ppo_chess_*.pt")
+            initialized = agent.load("models/ppo_chess", strict=False)
+            initialized_from = "models/ppo_chess" if initialized else "random_initialization"
+            if not initialized:
+                print("[WARN] PPO checkpoint unavailable; dopamine base uses current random initialization.")
+        else:
+            initialized_from = "random_initialization"
+        agent.save(DOPAMINE_BASE_PREFIX)
+    else:
+        agent.load(DOPAMINE_BASE_PREFIX, strict=False)
+
+    for target_prefix in (DOPAMINE_SELF_PREFIX, DOPAMINE_VS_PPO_PREFIX):
+        copy_checkpoint_pair(DOPAMINE_BASE_PREFIX, target_prefix)
+
+    agent.load(model_prefix, strict=False)
+    return initialized_from
+
 
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    training_agent = os.getenv("TRAINING_AGENT", "ppo").strip().lower()
-    dopamine_opponent_mode = os.getenv("DOPAMINE_OPPONENT_MODE", "selfplay").strip().lower()
-    if dopamine_opponent_mode not in {"selfplay", "ppo"}:
-        print(f"[WARN] Unknown DOPAMINE_OPPONENT_MODE='{dopamine_opponent_mode}', fallback to 'selfplay'.")
-        dopamine_opponent_mode = "selfplay"
-    if training_agent not in {"ppo", "dopamine"}:
-        print(f"[WARN] Unknown TRAINING_AGENT='{training_agent}', fallback to 'ppo'.")
-        training_agent = "ppo"
+    training_mode = os.getenv("TRAINING_MODE", os.getenv("TRAINING_AGENT", "ppo")).strip().lower()
+    legacy_mode_map = {"dopamine": "dopamine_self", "selfplay": "dopamine_self"}
+    training_mode = legacy_mode_map.get(training_mode, training_mode)
+    supported_modes = {"ppo", "dopamine_self", "dopamine_vs_ppo"}
+    if training_mode not in supported_modes:
+        print(f"[WARN] Unknown TRAINING_MODE='{training_mode}', fallback to 'ppo'.")
+        training_mode = "ppo"
+    training_agent = "ppo" if training_mode == "ppo" else "dopamine"
+    agent_type = "PPO" if training_agent == "ppo" else "DopaminePolicyGradient"
+    opponent_type = {
+        "ppo": "self_play_snapshots",
+        "dopamine_self": "dopamine_self_play_snapshots",
+        "dopamine_vs_ppo": "frozen_ppo",
+    }[training_mode]
+    seed = int(os.getenv("SEED", "0"))
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-    max_game_ply = None #240
+    max_game_ply_env = os.getenv("MAX_GAME_PLY", "").strip()
+    max_game_ply = int(max_game_ply_env) if max_game_ply_env else None
     curriculum_stage = 0
     endgame_max_extra_per_side = 4
     endgame_min_extra_total = 3
@@ -323,7 +355,7 @@ def main():
     # env = BoardEncoding(base_env, history_length=2)
     # Start games from random endgame positions to focus learning on
     # conversion/defense scenarios.
-    start_mode = "curriculum_endgame" if training_agent == "ppo" else "endgame"
+    start_mode = "curriculum_endgame" if training_mode == "ppo" else "endgame"
     base_env = Chess(
         start_mode=start_mode,
         endgame_max_extra_per_side=endgame_max_extra_per_side,
@@ -385,24 +417,26 @@ def main():
             entropy_coef=0.01,
             value_coef=0.5,
             max_grad_norm=0.6,
-            reward_scale=0.85,
-            reward_clip=2.5,
+            reward_scale=1.0,
+            reward_clip=None,
             temperature=1.0,
             temperature_min=0.7,
             temperature_max=1.2,
             mood_mean=1.0,
-            mood_std=0.3,
+            mood_std=0.0,
             mood_smoothing=0.3,
+            use_mood_modulation=os.getenv("USE_MOOD_MODULATION", "0") == "1",
         )
 
     #agent.load("models/ppo_chess")
     #opponent = RandomOpponent()
     # opponent = HeuristicOpponent()
-    opponent_pool = OpponentPool(max_size=8, p_latest=0.7, seed=0)
+    opponent_pool = OpponentPool(max_size=8, p_latest=0.7, seed=seed)
     fixed_opponents = [("random", RandomOpponent()), ("heuristic", HeuristicOpponent())]
-    fixed_opponent_prob = 0.0 #0.25
-    max_timesteps = 400000 #200000 #500
-    steps_per_update = 6144 #4096 #256 #
+    fixed_opponent_prob_default = "0.0"
+    fixed_opponent_prob = float(os.getenv("FIXED_OPPONENT_PROB", fixed_opponent_prob_default))
+    max_timesteps = int(os.getenv("MAX_TIMESTEPS", "400000"))
+    steps_per_update = int(os.getenv("STEPS_PER_UPDATE", "6144"))
     timestep = 0
     episode = 0
     # entropy_coef = agent.entropy_coef
@@ -413,37 +447,44 @@ def main():
 
 
 
-    #run_name = f"{opponent.__class__.__name__}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
-    if training_agent == "ppo":
-        model_prefix = "models/ppo_chess"
-        dopamine_agent_id = "ppo"
-    else:
-        model_prefix = resolve_dopamine_model_prefix()
-        dopamine_agent_id = os.path.basename(model_prefix).replace("dopamine_", "")
+    model_prefix = resolve_checkpoint_prefix(training_mode)
+    dopamine_agent_id = training_mode if training_agent == "dopamine" else "ppo"
+    initialized_from = model_prefix
 
+    print(f"[INFO] Training mode: {training_mode}")
     print(f"[INFO] Training checkpoint prefix: {model_prefix}")
-    agent.load(model_prefix, strict=False)
-
-    # Choose how the agent learns: against a static opponent or via self-play.
-    use_self_play = True
-    # opponent = RandomOpponent()
-    # opponent = HeuristicOpponent()
-    opponent_actor_source = agent.actor
-    if training_agent == "dopamine" and dopamine_opponent_mode == "ppo":
-        ppo_reference = PPO(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            device=device,
-        )
-        ppo_loaded = ppo_reference.load("models/ppo_chess", strict=False)
-        if ppo_loaded:
-            opponent_actor_source = ppo_reference.actor
-            print("[INFO] Dopamine opponent source set to PPO checkpoint models/ppo_chess_*.pt")
+    if training_agent == "dopamine" and os.getenv("INIT_DOPAMINE_BASE", "0") == "1":
+        initialized_from = initialize_dopamine_base(agent, model_prefix)
+    elif training_agent == "dopamine" and os.getenv("INIT_DOPAMINE_FROM_PPO", "0") == "1":
+        print("[INFO] Initializing dopamine actor/critic from models/ppo_chess_*.pt")
+        initialized = agent.load("models/ppo_chess", strict=False)
+        initialized_from = "models/ppo_chess" if initialized else "random_initialization"
+        if initialized:
+            agent.save(model_prefix)
         else:
-            print("[WARN] PPO checkpoint unavailable, fallback to dopamine self-play opponent snapshots.")
+            print("[WARN] PPO checkpoint unavailable; dopamine training starts from current initialization.")
+    else:
+        loaded = agent.load(model_prefix, strict=False)
+        initialized_from = model_prefix if loaded else "random_initialization"
+
+    use_self_play = training_mode in {"ppo", "dopamine_self"}
+    frozen_policy_opponent = None
+    if training_mode == "dopamine_vs_ppo":
+        ppo_reference = PPO(state_dim=state_dim, action_dim=action_dim, device=device)
+        ppo_loaded = ppo_reference.load("models/ppo_chess", strict=False)
+        if not ppo_loaded:
+            raise RuntimeError("TRAINING_MODE=dopamine_vs_ppo requires models/ppo_chess_*.pt")
+        ppo_reference.actor.eval()
+        frozen_policy_opponent = FrozenPolicyOpponent(
+            actor=ppo_reference.actor,
+            encoder=encoder,
+            flatten_obs=flatten_obs,
+            device=agent.device,
+            temperature=1.0,
+        )
 
     self_play_opponent = SelfPlayOpponent(
-        agent_actor=opponent_actor_source,
+        agent_actor=agent.actor,
         encoder=encoder,
         flatten_obs=flatten_obs,
         device=agent.device,
@@ -453,20 +494,17 @@ def main():
         temperature=agent.temperature,
     )
 
-    if training_agent == "dopamine" and dopamine_opponent_mode == "ppo":
-        opponent_pool.add(opponent_actor_source)
-    else:
+    if training_mode == "ppo":
         opponent_pool.add(agent.actor)
     update_count = 0
     snapshot_every = 10
-    if training_agent == "dopamine" and dopamine_opponent_mode == "ppo":
-        opponent_name = "PPO_reference"
-    else:
-        opponent_name = f"SelfPlay_{training_agent}"
-
-    if training_agent == "dopamine":
-        opponent_name = f"{opponent_name}_agent_{dopamine_agent_id}"
-    run_name = f"{opponent_name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+    run_prefix = {
+        "ppo": "PPO",
+        "dopamine_self": "DopamineSelf",
+        "dopamine_vs_ppo": "DopamineVsPPO",
+    }[training_mode]
+    opponent_name = opponent_type
+    run_name = f"{run_prefix}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
     log_dir = f"runs/{run_name}"
     os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=log_dir)
@@ -480,10 +518,16 @@ def main():
         "learning_rate_critic": 1e-3,
         "batch_size": 384,
         "epochs_per_update": 5,
+        "training_mode": training_mode,
+        "agent_type": agent_type,
+        "opponent_type": opponent_type,
+        "checkpoint_prefix": model_prefix,
+        "initialized_from": initialized_from,
+        "fixed_opponent_prob": fixed_opponent_prob,
+        "start_mode": start_mode,
+        "seed": seed,
         "training_agent": training_agent,
         "dopamine_agent_id": dopamine_agent_id,
-        "dopamine_opponent_mode": dopamine_opponent_mode,
-        "start_mode": start_mode,
         "opponent": opponent_name,
         "steps_per_update": steps_per_update,
         "entropy_coef_init": agent.entropy_coef,
@@ -493,8 +537,8 @@ def main():
         "entropy_target_end": entropy_target_end,
         "value_coef": 0.65,
         "selfplay_snapshot_pool": 6,
-        "target_kl": 0.015,
-        "reward_scale": 0.85,
+        "target_kl": 0.015 if training_agent == "ppo" else 0.0,
+        "reward_scale": agent.reward_scale,
         "temperature_init": agent.temperature,
         "temperature_min": agent.temperature_min,
         "temperature_max": agent.temperature_max,
@@ -527,7 +571,7 @@ def main():
         starting_fen = board.fen()
         game_moves = []
         final_info = None
-        opponent_label = "old_model" if use_self_play else "opponent"
+        opponent_label = opponent_type
         endgame_started = False
         endgame_start_ply = None
         endgame_reason = None
@@ -565,7 +609,7 @@ def main():
             # BUILD LEGAL MOVES + INDEX MAP
             # ----------------------------------------
 
-            idxs, idx_to_move = build_action_map(board, encoder)
+            idxs, idx_to_move, legal_mask_np = build_action_map(board, encoder)
 
             if not idxs:
                 reward = -1.0
@@ -583,9 +627,6 @@ def main():
                     terminal,
                 )
                 break
-
-            legal_mask_np = np.zeros(action_dim, dtype=np.float32)
-            legal_mask_np[idxs] = 1.0
 
             action_id, logprob, value = agent.select_action(state_np, legal_mask_np)
             policy_metrics = None
@@ -628,7 +669,7 @@ def main():
             if done:
                 final_info = info_agent
 
-            # Opponent (self-play) move before storing transition so the reward
+            # Opponent move before storing transition so the reward
             # reflects the full ply outcome.
             combined_reward = reward_agent
             ep_reward += reward_agent
@@ -662,7 +703,7 @@ def main():
             # obs_next, reward_agent, terminated, truncated, info = env.step(move)
             # done = terminated or truncated
 
-            # Opponent (self-play) move before storing transition so the reward
+            # Opponent move before storing transition so the reward
             # reflects the full ply outcome.
             # combined_reward = reward_agent
             # ep_reward += reward_agent
@@ -674,14 +715,12 @@ def main():
                         endgame_started = True
                         endgame_start_ply = base_env.move_count
                         endgame_reason = opp_analysis.endgame_reason
-                #if use_self_play:
-                # opp_move, _ = self_play_opponent.select_move(board, obs_next)
-                #else:
-                   # opp_move = opponent.choose_move(board)
-                if active_fixed_opponent is None:
+                if active_fixed_opponent is not None:
+                    opp_move = active_fixed_opponent[1].choose_move(board)
+                elif use_self_play:
                     opp_move, _ = self_play_opponent.select_move(board, obs_next)
                 else:
-                    opp_move = active_fixed_opponent[1].choose_move(board)
+                    opp_move, _ = frozen_policy_opponent.select_move(board, obs_next)
                 if opp_move is None:
                     done = True
                     terminal = True
@@ -712,7 +751,6 @@ def main():
                             "player": "white" if opp_board_before.turn == chess.WHITE else "black",
                             "uci": opp_move.uci(),
                             "san": opp_san,
-                            # "by": active_fixed_opponent[0] if active_fixed_opponent else "self_play_snapshot",
                             "by": opponent_label,
                             "reward_total": info_opp.get("reward_total", reward_opp),
                             "reward_terminal": info_opp.get("reward_terminal", 0.0),
@@ -727,9 +765,9 @@ def main():
                         }
                     )
 
-            # Bootstrap value for the next state to stabilize advantage estimates.
+            # Bootstrap value for the next state to compute TD-error targets.
             next_value = 0.0
-            if not terminal:
+            if not done:
                 next_state_np = flatten_obs(obs_next)
                 next_value = agent.evaluate_value(next_state_np)
 
@@ -738,7 +776,7 @@ def main():
                 action_id,
                 logprob,
                 combined_reward,
-                terminal,
+                done,
                 value,
                 next_value,
                 legal_mask_np,
@@ -751,7 +789,7 @@ def main():
             board = base_env._board
 
             if timestep % steps_per_update == 0:
-                print(f"\n{training_agent.upper()} UPDATE @ timestep {timestep}, episode {episode}")
+                print(f"\n{training_mode.upper()} UPDATE @ timestep {timestep}, episode {episode}")
                 progress = min(1.0, timestep / max_timesteps)
                 agent.entropy_target = entropy_target_start + (entropy_target_end - entropy_target_start) * progress
 
@@ -760,7 +798,10 @@ def main():
 
                 update_count += 1
 
-                if training_agent == "ppo" and update_count % snapshot_every == 0:
+                if training_mode == "dopamine_self" and update_count % snapshot_every == 0:
+                    opponent_pool.add(agent.actor)
+                    print(f"[POOL] Added dopamine self snapshot; pool size={len(opponent_pool.snapshots)}")
+                elif training_mode == "ppo" and update_count % snapshot_every == 0:
                     gate_score = quick_eval_gate(
                         agent.actor,
                         encoder,
@@ -812,25 +853,33 @@ def main():
                 writer.add_scalar("Loss/entropy", metrics["entropy"], timestep)
                 writer.add_scalar("Loss/entropy_normalized", metrics["normalized_entropy"], timestep)
                 writer.add_scalar("Loss/entropy_coef", metrics["entropy_coef"], timestep)
-                writer.add_scalar("KL/approx_kl", metrics["approx_kl"], timestep)
-                writer.add_scalar("KL/policy_shift", metrics["policy_shift_kl"], timestep)
-                writer.add_scalar("KL/policy_update", metrics["policy_update_kl"], timestep)
-                writer.add_scalar("Advantage/raw_mean", metrics["advantages_raw_mean"], timestep)
-                writer.add_scalar("Advantage/raw_std", metrics["advantages_raw_std"], timestep)
-                writer.add_scalar("Advantage/normalized_mean", metrics["advantages_norm_mean"], timestep)
-                writer.add_scalar("Advantage/normalized_std", metrics["advantages_norm_std"], timestep)
-                writer.add_scalar("Policy/expected_advantage", metrics["expected_advantage"], timestep)
-                writer.add_scalar("Policy/action_value_gap", metrics["action_value_gap"], timestep)
-                writer.add_scalar("Policy/policy_entropy", metrics["entropy"], timestep)
-                writer.add_scalar("Policy/policy_entropy_normalized", metrics["normalized_entropy"], timestep)
-                writer.add_scalar("Policy/entropy_target", agent.entropy_target, timestep)
-                writer.add_scalar("Policy/entropy_schedule_progress", progress, timestep)
-                writer.add_scalar("Policy/entropy_schedule_progress", progress, timestep)
+                if training_agent == "dopamine":
+                    writer.add_scalar("Dopamine/td_error_mean", metrics["td_error_mean"], timestep)
+                    writer.add_scalar("Dopamine/td_error_abs_mean", metrics["td_error_abs_mean"], timestep)
+                    writer.add_scalar("Dopamine/td_error_std", metrics["td_error_std"], timestep)
+                    writer.add_scalar("Dopamine/td_error_positive_rate", metrics["td_error_positive_rate"], timestep)
+                    writer.add_scalar("Dopamine/td_lambda_adv_mean", metrics["td_lambda_adv_mean"], timestep)
+                    writer.add_scalar("Dopamine/td_lambda_adv_std", metrics["td_lambda_adv_std"], timestep)
+                    writer.add_scalar("Dopamine/actor_signal_mean", metrics["actor_signal_mean"], timestep)
+                    writer.add_scalar("Dopamine/actor_signal_std", metrics["actor_signal_std"], timestep)
+                    if metrics.get("use_mood_modulation", False):
+                        writer.add_scalar("Dopamine/mood_scale_mean", metrics["mood_scale_mean"], timestep)
+                    writer.add_scalar("Policy/legal_entropy", metrics["legal_entropy"], timestep)
+                else:
+                    writer.add_scalar("KL/approx_kl", metrics["approx_kl"], timestep)
+                    writer.add_scalar("KL/policy_shift", metrics["policy_shift_kl"], timestep)
+                    writer.add_scalar("KL/policy_update", metrics["policy_update_kl"], timestep)
+                    writer.add_scalar("Advantage/raw_mean", metrics["advantages_raw_mean"], timestep)
+                    writer.add_scalar("Advantage/raw_std", metrics["advantages_raw_std"], timestep)
+                    writer.add_scalar("Advantage/normalized_mean", metrics["advantages_norm_mean"], timestep)
+                    writer.add_scalar("Advantage/normalized_std", metrics["advantages_norm_std"], timestep)
+                    writer.add_scalar("Policy/expected_advantage", metrics["expected_advantage"], timestep)
+                    writer.add_scalar("Policy/action_value_gap", metrics["action_value_gap"], timestep)
+                    writer.add_scalar("Policy/policy_entropy", metrics["entropy"], timestep)
+                    writer.add_scalar("Policy/policy_entropy_normalized", metrics["normalized_entropy"], timestep)
+                    writer.add_scalar("Policy/entropy_target", agent.entropy_target, timestep)
+                    writer.add_scalar("Policy/entropy_schedule_progress", progress, timestep)
                 writer.add_scalar("Policy/temperature", metrics["temperature"], timestep)
-                if "mood_mean" in metrics:
-                    writer.add_scalar("Dopamine/mood_mean", metrics["mood_mean"], timestep)
-                if "mood_scale_mean" in metrics:
-                    writer.add_scalar("Dopamine/mood_scale_mean", metrics["mood_scale_mean"], timestep)
                 writer.add_scalar("Optimization/minibatches", metrics["updates_run"], timestep)
                 writer.add_scalar("Timesteps/timestep", timestep, timestep)
                 writer.flush()
