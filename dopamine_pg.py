@@ -77,9 +77,9 @@ class DopaminePolicyGradient:
         temperature_min: float = 0.7,
         temperature_max: float = 1.3,
         mood_mean: float = 1.0,
-        mood_std: float = 0.5,
+        mood_std: float = 1.3,
         mood_smoothing: float = 0.2,
-        use_mood_modulation: bool = False,
+        use_mood_modulation: bool = True,
         device: str = "cpu",
     ):
         self.device = torch.device(device)

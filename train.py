@@ -615,16 +615,17 @@ def main():
                 reward = -1.0
                 done = True
                 terminal = True
-                agent.store_transition(
-                    state_np,
-                    0,
-                    0.0,
-                    reward,
-                    done,
-                    0.0,
-                    0.0,
-                    np.zeros(action_dim, dtype=np.float32),
-                    terminal,
+                if training_agent != "dopamine":
+                    agent.store_transition(
+                        state_np,
+                        0,
+                        0.0,
+                        reward,
+                        done,
+                        0.0,
+                        0.0,
+                        np.zeros(action_dim, dtype=np.float32),
+                        terminal,
                 )
                 break
 
