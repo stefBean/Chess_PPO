@@ -23,6 +23,7 @@ class DopamineRolloutBuffer:
         self.td_errors = []
         self.dopamine_deltas = []
         self.mood_scales = []
+        self.mood_labels = []
 
     def clear(self):
         self.__init__()
@@ -40,6 +41,7 @@ class DopamineRolloutBuffer:
         terminal,
         td_error,
         mood_scale,
+        mood_label,
     ):
         self.states.append(state)
         self.actions.append(action)
@@ -53,6 +55,7 @@ class DopamineRolloutBuffer:
         self.td_errors.append(td_error)
         self.dopamine_deltas.append(td_error)
         self.mood_scales.append(mood_scale)
+        self.mood_labels.append(mood_label)
 
 
 class DopaminePolicyGradient:
@@ -79,6 +82,7 @@ class DopaminePolicyGradient:
         mood_mean: float = 1.0,
         mood_std: float = 1.3,
         mood_smoothing: float = 0.2,
+        mood_mode_prob: float = 0.4,
         use_mood_modulation: bool = True,
         device: str = "cpu",
     ):
@@ -99,8 +103,10 @@ class DopaminePolicyGradient:
         self.mood_mean = mood_mean
         self.mood_std = mood_std
         self.mood_smoothing = mood_smoothing
+        self.mood_mode_prob = mood_mode_prob
         self.use_mood_modulation = use_mood_modulation
         self.current_mood = mood_mean
+        self.current_mood_label = "neutral"
         self.entropy_target = 0.0
         self.entropy_coef_min = entropy_coef
         self.entropy_coef_max = entropy_coef
@@ -111,16 +117,31 @@ class DopaminePolicyGradient:
         self.optim_critic = Adam(self.critic.parameters(), lr=critic_lr)
         self.buffer = DopamineRolloutBuffer()
 
-    def _sample_mood_scale(self) -> float:
+    def _sample_mood_scale(self) -> tuple[float, str]:
         if not self.use_mood_modulation:
             self.current_mood = self.mood_mean
-            return 1.0
-        instant = float(np.random.normal(loc=self.mood_mean, scale=self.mood_std))
+            self.current_mood_label = "neutral"
+            return 1.0, self.current_mood_label
+
+        mode_roll = float(np.random.random())
+        mode_band = max(0.0, min(0.5, self.mood_mode_prob))
+        if mode_roll < mode_band:
+            label = "pessimistic"
+            loc = self.mood_mean - self.mood_std
+        elif mode_roll > 1.0 - mode_band:
+            label = "optimistic"
+            loc = self.mood_mean + self.mood_std
+        else:
+            label = "neutral"
+            loc = self.mood_mean
+
+        instant = float(np.random.normal(loc=loc, scale=max(self.mood_std, 1e-6)))
         self.current_mood = (
             (1.0 - self.mood_smoothing) * self.current_mood
             + self.mood_smoothing * instant
         )
-        return max(0.05, self.current_mood)
+        self.current_mood_label = label
+        return max(0.05, self.current_mood), label
 
     def select_action(self, state_np: np.ndarray, legal_mask_np: np.ndarray):
         state = torch.from_numpy(state_np).float().to(self.device).unsqueeze(0)
@@ -167,7 +188,7 @@ class DopaminePolicyGradient:
             reward_signal = float(np.clip(reward_signal, -self.reward_clip, self.reward_clip))
         done_float = 1.0 if done else 0.0
         td_error = reward_signal + self.gamma * float(next_value) * (1.0 - done_float) - float(value)
-        mood_scale = self._sample_mood_scale()
+        mood_scale, mood_label = self._sample_mood_scale()
         self.buffer.add(
             state_np,
             action,
@@ -180,6 +201,7 @@ class DopaminePolicyGradient:
             terminal,
             td_error,
             mood_scale,
+            mood_label,
         )
 
     def _compute_td_lambda_advantages(self, td_errors, dones):
@@ -244,6 +266,8 @@ class DopaminePolicyGradient:
                 "legal_entropy": 0.0,
                 "mood_mean": self.current_mood,
                 "mood_scale_mean": 1.0,
+                "mood_optimistic_rate": 0.0,
+                "mood_pessimistic_rate": 0.0,
             }
 
         states = torch.tensor(np.array(self.buffer.states), dtype=torch.float32, device=self.device)
@@ -301,6 +325,9 @@ class DopaminePolicyGradient:
                 updates_run += 1
 
         mood_scale_mean = float(np.mean(self.buffer.mood_scales)) if self.buffer.mood_scales else float(self.current_mood)
+        mood_labels = list(self.buffer.mood_labels)
+        mood_optimistic_rate = float(np.mean([label == "optimistic" for label in mood_labels])) if mood_labels else 0.0
+        mood_pessimistic_rate = float(np.mean([label == "pessimistic" for label in mood_labels])) if mood_labels else 0.0
         self.buffer.clear()
         entropy_mean = float(np.mean(entropies)) if entropies else 0.0
         legal_counts = masks.sum(dim=1).clamp_min(2.0)
@@ -317,7 +344,7 @@ class DopaminePolicyGradient:
             "advantages_raw_mean": float(td_lambda_adv.mean().item()),
             "advantages_raw_std": float(td_lambda_adv.std(unbiased=False).item()),
             "advantages_norm_mean": float(dopamine_adv.mean().item()),
-            "advantages_norm_std": float(dopamine_adv.std().item()),
+            "advantages_norm_std": float(dopamine_adv.std(unbiased=False).item()),
             "expected_advantage": float(td_errors_t.mean().item()),
             "action_value_gap": 0.0,
             "temperature": self.temperature,
@@ -333,6 +360,8 @@ class DopaminePolicyGradient:
             "legal_entropy": entropy_mean,
             "mood_mean": float(self.current_mood),
             "mood_scale_mean": mood_scale_mean,
+            "mood_optimistic_rate": mood_optimistic_rate,
+            "mood_pessimistic_rate": mood_pessimistic_rate,
             "use_mood_modulation": self.use_mood_modulation,
         }
 
