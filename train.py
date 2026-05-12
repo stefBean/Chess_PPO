@@ -8,6 +8,7 @@ import time
 import random
 import json
 import os
+import glob
 import shutil
 import sys
 import threading
@@ -265,6 +266,7 @@ def build_endgame_snapshot(board, analyzer):
 DOPAMINE_SELF_PREFIX = "models/dopamine_self_chess"
 DOPAMINE_VS_PPO_PREFIX = "models/dopamine_vs_ppo_chess"
 DOPAMINE_BASE_PREFIX = "models/dopamine_base_chess"
+DOPAMINE_RANDOM_BASE_PREFIX = "models/dopamine_random_base_chess"
 
 
 def resolve_checkpoint_prefix(training_mode: str) -> str:
@@ -276,6 +278,21 @@ def resolve_checkpoint_prefix(training_mode: str) -> str:
     if training_mode == "dopamine_vs_ppo":
         return DOPAMINE_VS_PPO_PREFIX
     raise ValueError(f"Unsupported training mode: {training_mode}")
+
+
+def discover_checkpoint_prefixes(primary_prefix: str, extra_globs: list[str] | None = None) -> list[str]:
+    """Find actor/critic checkpoint prefixes, keeping only complete pairs."""
+    candidates = {primary_prefix}
+    for pattern in extra_globs or []:
+        for actor_path in glob.glob(pattern):
+            if actor_path.endswith("_actor.pt"):
+                candidates.add(actor_path[:-len("_actor.pt")])
+
+    complete_prefixes = []
+    for prefix in sorted(candidates):
+        if os.path.exists(f"{prefix}_actor.pt") and os.path.exists(f"{prefix}_critic.pt"):
+            complete_prefixes.append(prefix)
+    return complete_prefixes
 
 
 def copy_checkpoint_pair(source_prefix: str, target_prefix: str) -> bool:
@@ -291,27 +308,30 @@ def copy_checkpoint_pair(source_prefix: str, target_prefix: str) -> bool:
     return True
 
 
-def initialize_dopamine_base(agent: DopaminePolicyGradient, model_prefix: str) -> str:
+def initialize_dopamine_base(agent: DopaminePolicyGradient, model_prefix: str, allow_ppo_init: bool = True) -> str:
     """Initialize dopamine experiment checkpoints from one shared base."""
-    base_actor = f"{DOPAMINE_BASE_PREFIX}_actor.pt"
-    base_critic = f"{DOPAMINE_BASE_PREFIX}_critic.pt"
-    initialized_from = DOPAMINE_BASE_PREFIX
+    base_prefix = DOPAMINE_BASE_PREFIX if allow_ppo_init else DOPAMINE_RANDOM_BASE_PREFIX
+    base_actor = f"{base_prefix}_actor.pt"
+    base_critic = f"{base_prefix}_critic.pt"
+    initialized_from = base_prefix
 
     if not (os.path.exists(base_actor) and os.path.exists(base_critic)):
-        if os.getenv("INIT_DOPAMINE_FROM_PPO", "0") == "1":
+        if os.getenv("INIT_DOPAMINE_FROM_PPO", "0") == "1" and allow_ppo_init:
             print("[INFO] Creating shared dopamine base from models/ppo_chess_*.pt")
             initialized = agent.load("models/ppo_chess", strict=False)
             initialized_from = "models/ppo_chess" if initialized else "random_initialization"
             if not initialized:
                 print("[WARN] PPO checkpoint unavailable; dopamine base uses current random initialization.")
         else:
+            if os.getenv("INIT_DOPAMINE_FROM_PPO", "0") == "1" and not allow_ppo_init:
+                print("[WARN] PPO initialization disabled for this dopamine training mode; using dopamine/random base.")
             initialized_from = "random_initialization"
-        agent.save(DOPAMINE_BASE_PREFIX)
+        agent.save(base_prefix)
     else:
-        agent.load(DOPAMINE_BASE_PREFIX, strict=False)
+        agent.load(base_prefix, strict=False)
 
     for target_prefix in (DOPAMINE_SELF_PREFIX, DOPAMINE_VS_PPO_PREFIX):
-        copy_checkpoint_pair(DOPAMINE_BASE_PREFIX, target_prefix)
+        copy_checkpoint_pair(base_prefix, target_prefix)
 
     agent.load(model_prefix, strict=False)
     return initialized_from
@@ -331,9 +351,15 @@ def main():
     opponent_type = {
         "ppo": "self_play_snapshots",
         "dopamine_self": "dopamine_self_play_snapshots",
-        "dopamine_vs_ppo": "frozen_ppo",
+        "dopamine_vs_ppo": "frozen_ppo_pool",
     }[training_mode]
-    seed = int(os.getenv("SEED", "0"))
+    seed_env = os.getenv("SEED")
+    if seed_env is None or seed_env.strip() == "":
+        seed = int.from_bytes(os.urandom(4), "big")
+        print(f"[INFO] SEED not set; using generated seed {seed}")
+    else:
+        seed = int(seed_env)
+        print(f"[INFO] Using configured seed {seed}")
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -422,10 +448,11 @@ def main():
             temperature=1.0,
             temperature_min=0.7,
             temperature_max=1.2,
-            mood_mean=1.0,
-            mood_std=0.0,
-            mood_smoothing=0.3,
-            use_mood_modulation=os.getenv("USE_MOOD_MODULATION", "0") == "1",
+            mood_mean=float(os.getenv("MOOD_MEAN", "1.0")),
+            mood_std=float(os.getenv("MOOD_STD", "0.35")),
+            mood_smoothing=float(os.getenv("MOOD_SMOOTHING", "0.3")),
+            mood_mode_prob=float(os.getenv("MOOD_MODE_PROB", "0.4")),
+            use_mood_modulation=os.getenv("USE_MOOD_MODULATION", "1") == "1",
         )
 
     #agent.load("models/ppo_chess")
@@ -454,33 +481,73 @@ def main():
     print(f"[INFO] Training mode: {training_mode}")
     print(f"[INFO] Training checkpoint prefix: {model_prefix}")
     if training_agent == "dopamine" and os.getenv("INIT_DOPAMINE_BASE", "0") == "1":
-        initialized_from = initialize_dopamine_base(agent, model_prefix)
+        initialized_from = initialize_dopamine_base(
+            agent,
+            model_prefix,
+            allow_ppo_init=training_mode != "dopamine_vs_ppo",
+        )
     elif training_agent == "dopamine" and os.getenv("INIT_DOPAMINE_FROM_PPO", "0") == "1":
-        print("[INFO] Initializing dopamine actor/critic from models/ppo_chess_*.pt")
-        initialized = agent.load("models/ppo_chess", strict=False)
-        initialized_from = "models/ppo_chess" if initialized else "random_initialization"
-        if initialized:
-            agent.save(model_prefix)
+        if training_mode == "dopamine_vs_ppo":
+            print(
+                "[WARN] INIT_DOPAMINE_FROM_PPO is ignored for dopamine_vs_ppo; "
+                "only the opponent may load PPO checkpoints."
+            )
+            loaded = agent.load(model_prefix, strict=False)
+            initialized_from = model_prefix if loaded else "random_initialization"
         else:
-            print("[WARN] PPO checkpoint unavailable; dopamine training starts from current initialization.")
+            print("[INFO] Initializing dopamine actor/critic from models/ppo_chess_*.pt")
+            initialized = agent.load("models/ppo_chess", strict=False)
+            initialized_from = "models/ppo_chess" if initialized else "random_initialization"
+            if initialized:
+                agent.save(model_prefix)
+            else:
+                print("[WARN] PPO checkpoint unavailable; dopamine training starts from current initialization.")
     else:
         loaded = agent.load(model_prefix, strict=False)
         initialized_from = model_prefix if loaded else "random_initialization"
 
     use_self_play = training_mode in {"ppo", "dopamine_self"}
-    frozen_policy_opponent = None
+    frozen_policy_opponents = []
     if training_mode == "dopamine_vs_ppo":
-        ppo_reference = PPO(state_dim=state_dim, action_dim=action_dim, device=device)
-        ppo_loaded = ppo_reference.load("models/ppo_chess", strict=False)
-        if not ppo_loaded:
-            raise RuntimeError("TRAINING_MODE=dopamine_vs_ppo requires models/ppo_chess_*.pt")
-        ppo_reference.actor.eval()
-        frozen_policy_opponent = FrozenPolicyOpponent(
-            actor=ppo_reference.actor,
-            encoder=encoder,
-            flatten_obs=flatten_obs,
-            device=agent.device,
-            temperature=1.0,
+        ppo_prefixes = discover_checkpoint_prefixes(
+            "models/ppo_chess",
+            extra_globs=[
+                "models/ppo_chess_actor.pt",
+                "models/old/ppo_chess_actor.pt",
+                "models/ppo_*_actor.pt",
+                "models/old/ppo_*_actor.pt",
+            ],
+        )
+        if not ppo_prefixes:
+            print("[WARN] No PPO checkpoint pairs found; dopamine_vs_ppo will use random/heuristic opponents.")
+        for ppo_prefix in ppo_prefixes:
+            ppo_reference = PPO(state_dim=state_dim, action_dim=action_dim, device=device)
+            try:
+                loaded = ppo_reference.load(ppo_prefix, strict=False)
+            except RuntimeError as exc:
+                print(f"[WARN] Skipping incompatible PPO checkpoint {ppo_prefix}: {exc}")
+                continue
+            if not loaded:
+                continue
+            ppo_reference.actor.eval()
+            frozen_policy_opponents.append(
+                (
+                    os.path.basename(ppo_prefix),
+                    FrozenPolicyOpponent(
+                        actor=ppo_reference.actor,
+                        encoder=encoder,
+                        flatten_obs=flatten_obs,
+                        device=agent.device,
+                        temperature=1.0,
+                    ),
+                )
+            )
+        if not frozen_policy_opponents:
+            print("[WARN] No compatible PPO checkpoints loaded; dopamine_vs_ppo will use random/heuristic opponents.")
+            frozen_policy_opponents.extend(fixed_opponents)
+        print(
+            "[INFO] Opponent pool: "
+            + ", ".join(label for label, _ in frozen_policy_opponents)
         )
 
     self_play_opponent = SelfPlayOpponent(
@@ -542,6 +609,10 @@ def main():
         "temperature_init": agent.temperature,
         "temperature_min": agent.temperature_min,
         "temperature_max": agent.temperature_max,
+        "mood_modulation": getattr(agent, "use_mood_modulation", False),
+        "mood_std": getattr(agent, "mood_std", 0.0),
+        "mood_mode_prob": getattr(agent, "mood_mode_prob", 0.0),
+        "ppo_opponent_pool_size": len(frozen_policy_opponents),
     }
     try:
         tb_process = subprocess.Popen(
@@ -571,7 +642,11 @@ def main():
         starting_fen = board.fen()
         game_moves = []
         final_info = None
+        active_policy_opponent = None
         opponent_label = opponent_type
+        if training_mode == "dopamine_vs_ppo":
+            ppo_label, active_policy_opponent = random.choice(frozen_policy_opponents)
+            opponent_label = f"ppo:{ppo_label}" if hasattr(active_policy_opponent, "select_move") else ppo_label
         endgame_started = False
         endgame_start_ply = None
         endgame_reason = None
@@ -721,7 +796,10 @@ def main():
                 elif use_self_play:
                     opp_move, _ = self_play_opponent.select_move(board, obs_next)
                 else:
-                    opp_move, _ = frozen_policy_opponent.select_move(board, obs_next)
+                    if hasattr(active_policy_opponent, "select_move"):
+                        opp_move, _ = active_policy_opponent.select_move(board, obs_next)
+                    else:
+                        opp_move = active_policy_opponent.choose_move(board)
                 if opp_move is None:
                     done = True
                     terminal = True
@@ -865,6 +943,8 @@ def main():
                     writer.add_scalar("Dopamine/actor_signal_std", metrics["actor_signal_std"], timestep)
                     if metrics.get("use_mood_modulation", False):
                         writer.add_scalar("Dopamine/mood_scale_mean", metrics["mood_scale_mean"], timestep)
+                        writer.add_scalar("Dopamine/mood_optimistic_rate", metrics["mood_optimistic_rate"], timestep)
+                        writer.add_scalar("Dopamine/mood_pessimistic_rate", metrics["mood_pessimistic_rate"], timestep)
                     writer.add_scalar("Policy/legal_entropy", metrics["legal_entropy"], timestep)
                 else:
                     writer.add_scalar("KL/approx_kl", metrics["approx_kl"], timestep)
