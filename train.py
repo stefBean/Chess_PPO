@@ -11,6 +11,7 @@ import os
 import shutil
 import sys
 import threading
+import glob
 
 from board_environment import Chess
 from board_encoding import BoardEncoding
@@ -422,10 +423,11 @@ def main():
             temperature=1.0,
             temperature_min=0.7,
             temperature_max=1.2,
-            mood_mean=1.0,
-            mood_std=0.0,
-            mood_smoothing=0.3,
-            use_mood_modulation=os.getenv("USE_MOOD_MODULATION", "0") == "1",
+            mood_mean=float(os.getenv("MOOD_MEAN", "1.0")),
+            mood_std=float(os.getenv("MOOD_STD", "0.35")),
+            mood_smoothing=float(os.getenv("MOOD_SMOOTHING", "0.3")),
+            mood_mode_prob=float(os.getenv("MOOD_MODE_PROB", "0.4")),
+            use_mood_modulation=os.getenv("USE_MOOD_MODULATION", "1") == "1",
         )
 
     #agent.load("models/ppo_chess")
@@ -542,6 +544,9 @@ def main():
         "temperature_init": agent.temperature,
         "temperature_min": agent.temperature_min,
         "temperature_max": agent.temperature_max,
+        "mood_modulation": getattr(agent, "use_mood_modulation", False),
+        "mood_std": getattr(agent, "mood_std", 0.0),
+        "mood_mode_prob": getattr(agent, "mood_mode_prob", 0.0),
     }
     try:
         tb_process = subprocess.Popen(
@@ -863,8 +868,9 @@ def main():
                     writer.add_scalar("Dopamine/td_lambda_adv_std", metrics["td_lambda_adv_std"], timestep)
                     writer.add_scalar("Dopamine/actor_signal_mean", metrics["actor_signal_mean"], timestep)
                     writer.add_scalar("Dopamine/actor_signal_std", metrics["actor_signal_std"], timestep)
-                    if metrics.get("use_mood_modulation", False):
-                        writer.add_scalar("Dopamine/mood_scale_mean", metrics["mood_scale_mean"], timestep)
+                    writer.add_scalar("Dopamine/mood_scale_mean", metrics["mood_scale_mean"], timestep)
+                    writer.add_scalar("Dopamine/mood_optimistic_rate", metrics["mood_optimistic_rate"], timestep)
+                    writer.add_scalar("Dopamine/mood_pessimistic_rate", metrics["mood_pessimistic_rate"], timestep)
                     writer.add_scalar("Policy/legal_entropy", metrics["legal_entropy"], timestep)
                 else:
                     writer.add_scalar("KL/approx_kl", metrics["approx_kl"], timestep)
