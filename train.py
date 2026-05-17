@@ -300,13 +300,10 @@ def initialize_dopamine_base(agent: DopaminePolicyGradient, model_prefix: str) -
 
     if not (os.path.exists(base_actor) and os.path.exists(base_critic)):
         if os.getenv("INIT_DOPAMINE_FROM_PPO", "0") == "1":
-            print("[INFO] Creating shared dopamine base from models/ppo_chess_*.pt")
-            initialized = agent.load("models/ppo_chess", strict=False)
-            initialized_from = "models/ppo_chess" if initialized else "random_initialization"
-            if not initialized:
-                print("[WARN] PPO checkpoint unavailable; dopamine base uses current random initialization.")
-        else:
-            initialized_from = "random_initialization"
+            raise RuntimeError(
+                "INIT_DOPAMINE_FROM_PPO is disabled to preserve dopamine experiment isolation. "
+                "Shared dopamine bases must be created from non-PPO initialization."
+            )
         agent.save(DOPAMINE_BASE_PREFIX)
     else:
         agent.load(DOPAMINE_BASE_PREFIX, strict=False)
@@ -437,6 +434,12 @@ def main():
     fixed_opponents = [("random", RandomOpponent()), ("heuristic", HeuristicOpponent())]
     fixed_opponent_prob_default = "0.0"
     fixed_opponent_prob = float(os.getenv("FIXED_OPPONENT_PROB", fixed_opponent_prob_default))
+    if training_mode in {"dopamine_self", "dopamine_vs_ppo"} and fixed_opponent_prob != 0.0:
+        raise RuntimeError(
+            f"TRAINING_MODE={training_mode} forbids FIXED_OPPONENT_PROB={fixed_opponent_prob}. "
+            "Dopamine protocol isolation requires dopamine_self to play only dopamine self-play "
+            "snapshots and dopamine_vs_ppo to play only the frozen PPO opponent."
+        )
     max_timesteps = int(os.getenv("MAX_TIMESTEPS", "400000"))
     steps_per_update = int(os.getenv("STEPS_PER_UPDATE", "6144"))
     timestep = 0
@@ -455,16 +458,14 @@ def main():
 
     print(f"[INFO] Training mode: {training_mode}")
     print(f"[INFO] Training checkpoint prefix: {model_prefix}")
+    if training_agent == "dopamine" and os.getenv("INIT_DOPAMINE_FROM_PPO", "0") == "1":
+        raise RuntimeError(
+            "INIT_DOPAMINE_FROM_PPO is disabled to preserve dopamine experiment isolation. "
+            "Use INIT_DOPAMINE_BASE=1 for a shared non-PPO dopamine initialization instead."
+        )
+
     if training_agent == "dopamine" and os.getenv("INIT_DOPAMINE_BASE", "0") == "1":
         initialized_from = initialize_dopamine_base(agent, model_prefix)
-    elif training_agent == "dopamine" and os.getenv("INIT_DOPAMINE_FROM_PPO", "0") == "1":
-        print("[INFO] Initializing dopamine actor/critic from models/ppo_chess_*.pt")
-        initialized = agent.load("models/ppo_chess", strict=False)
-        initialized_from = "models/ppo_chess" if initialized else "random_initialization"
-        if initialized:
-            agent.save(model_prefix)
-        else:
-            print("[WARN] PPO checkpoint unavailable; dopamine training starts from current initialization.")
     else:
         loaded = agent.load(model_prefix, strict=False)
         initialized_from = model_prefix if loaded else "random_initialization"

@@ -3,7 +3,7 @@ import json
 import os
 import random
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import chess
 import numpy as np
@@ -13,8 +13,7 @@ from action_encoding import AlphaZeroActionEncoder, build_action_map
 from board_encoding import BoardEncoding
 from board_environment import Chess
 from dopamine_pg import DopaminePolicyGradient
-from opponent_heuristic import HeuristicOpponent
-from opponent_random import RandomOpponent
+
 from opponent_selfplay import FrozenPolicyOpponent
 from ppo import PPO
 from train import (
@@ -34,6 +33,11 @@ class EvaluationConfig:
     endgame_max_extra_per_side: int = 4
     endgame_min_extra_total: int = 3
     require_pawn: bool = False
+    checkpoint_step: Optional[int] = (
+        int(os.getenv("EVAL_CHECKPOINT_STEP"))
+        if os.getenv("EVAL_CHECKPOINT_STEP", "").strip()
+        else None
+    )
 
 
 def make_env(config: EvaluationConfig) -> Tuple[Chess, BoardEncoding]:
@@ -233,36 +237,57 @@ def evaluate_dopamine_comparison():
     }
     ppo_actor = load_ppo_actor(state_dim, action_dim, device)
 
-    opponents = {
-        "random": RandomOpponent(),
-        "heuristic": HeuristicOpponent(),
-        "frozen_ppo": FrozenPolicyOpponent(ppo_actor, encoder, flatten_obs, torch.device(device), deterministic=True),
-        "dopamine_self_snapshot": FrozenPolicyOpponent(agents["dopamine_self"].actor, encoder, flatten_obs, torch.device(device), deterministic=True),
-        "dopamine_vs_ppo_snapshot": FrozenPolicyOpponent(agents["dopamine_vs_ppo"].actor, encoder, flatten_obs, torch.device(device), deterministic=True),
+    protocol_pairings = {
+        "dopamine_self": (
+            "dopamine_self_snapshot",
+            FrozenPolicyOpponent(
+                agents["dopamine_self"].actor,
+                encoder,
+                flatten_obs,
+                torch.device(device),
+                deterministic=True,
+            ),
+        ),
+        "dopamine_vs_ppo": (
+            "frozen_ppo",
+            FrozenPolicyOpponent(
+                ppo_actor,
+                encoder,
+                flatten_obs,
+                torch.device(device),
+                deterministic=True,
+            ),
+        ),
     }
 
     details = []
     aggregates = []
     for agent_name, agent in agents.items():
-        for opponent_name, opponent in opponents.items():
-            games = []
-            for game_idx in range(config.games):
-                agent_color = chess.WHITE if game_idx % 2 == 0 else chess.BLACK
-                game = evaluate_one_game(agent, opponent, encoder, config, game_idx, agent_color)
-                game.update({"agent": agent_name, "opponent": opponent_name, "game_index": game_idx})
-                games.append(game)
-                details.append(game)
-            aggregate = aggregate_games(games)
-            aggregate.update({"agent": agent_name, "opponent": opponent_name})
-            aggregates.append(aggregate)
+        opponent_name, opponent = protocol_pairings[agent_name]
+        games = []
+        for game_idx in range(config.games):
+            agent_color = chess.WHITE if game_idx % 2 == 0 else chess.BLACK
+            game = evaluate_one_game(agent, opponent, encoder, config, game_idx, agent_color)
+            game.update({"agent": agent_name, "opponent": opponent_name, "game_index": game_idx})
+            games.append(game)
+            details.append(game)
+        aggregate = aggregate_games(games)
+        aggregate.update({"agent": agent_name, "opponent": opponent_name})
+        aggregates.append(aggregate)
 
     os.makedirs("evaluation_results", exist_ok=True)
-    json_path = "evaluation_results/dopamine_comparison.json"
-    csv_path = "evaluation_results/dopamine_comparison.csv"
+    output_suffix = f"_step_{config.checkpoint_step}" if config.checkpoint_step is not None else ""
+    json_path = f"evaluation_results/dopamine_comparison{output_suffix}.json"
+    csv_path = f"evaluation_results/dopamine_comparison{output_suffix}.csv"
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(
             {
                 "config": config.__dict__,
+                "protocol": "isolated_dopamine_pairings",
+                "allowed_pairings": {
+                    "dopamine_self": "dopamine_self_snapshot",
+                    "dopamine_vs_ppo": "frozen_ppo",
+                },
                 "checkpoint_prefixes": {
                     "dopamine_self": DOPAMINE_SELF_PREFIX,
                     "dopamine_vs_ppo": DOPAMINE_VS_PPO_PREFIX,
