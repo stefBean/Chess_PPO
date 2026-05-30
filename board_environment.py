@@ -109,43 +109,27 @@ class Chess(gym.Env):
         #: or the previous game has ended.
         self._ready: bool = False
 
-    def reset(self,*, seed=None, options=None):
-        if seed is not None:
-            import random, numpy as np
-            np.random.seed(seed)
-            random.seed(seed)
-
-        # self._board = chess.Board()
-        self.move_count = 0
+    def reset(self, *, seed=None, options=None):
         options = options or {}
-        # self.max_ply = int(options.get("max_ply", self.max_ply))
-        max_ply_option = options.get("max_ply", self.max_ply)
-        if max_ply_option is None:
-            self.max_ply = None
-        else:
-            self.max_ply = int(max_ply_option)
-        desired_color = options.get("agent_color")
-        self.no_progress = 0
-        stage = options.get("curriculum_stage")
-        if stage is not None:
-            try:
-                self.curriculum_stage = int(stage)
-            except (TypeError, ValueError):
-                pass
 
-        if self.start_mode == "endgame":
+        start_fen = options.get("start_fen")
+        if start_fen is not None:
+            self._board = chess.Board(start_fen)
+        elif self.start_mode == "endgame":
             self._board = self._generate_endgame_board()
         elif self.start_mode == "curriculum_endgame":
             self._board = self._generate_curriculum_endgame_board()
         else:
             self._board = chess.Board()
 
+        desired_color = options.get("agent_color")
         if desired_color in (chess.WHITE, chess.BLACK):
             self._board.turn = desired_color
 
+        self.move_count = 0
+        self.no_progress = 0
         self._ready = True
-        info = {}
-        return self._observation(), info
+        return self._observation(), {}
 
     def step(self, action: chess.Move):
 
